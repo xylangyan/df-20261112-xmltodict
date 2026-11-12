@@ -74,6 +74,55 @@ It also lets you collapse certain namespaces to shorthand prefixes, or skip them
 True
 ```
 
+### Namespace scopes and round-tripping
+
+Documents that re-bind a prefix inside a subtree (or clear the default
+namespace with `xmlns=""`) need scope information to survive a
+parse → edit → unparse round trip: without it, siblings after the
+re-binding element can fall into the wrong namespace, and a subtree
+extracted from the dict cannot be serialized on its own because the
+bindings it inherited are gone.
+
+`parse(..., process_namespaces=True, namespace_scope=True)` records the
+in-scope prefix bindings on every element under `@xmlns:scope`
+(`''` is the default namespace; `None` marks an explicitly undeclared
+prefix). `unparse(..., expand_namespaces=True)` consumes those entries
+(they are never written out as attributes), emits any missing `xmlns`
+declarations, and guarantees that the expanded names in the output match
+the input — the prefix spelling itself may change:
+
+```python
+>>> xml = '''<root xmlns:p="http://outer.example/">
+...   <p:outer>
+...     <sub xmlns:p="http://inner.example/"><p:inner/></sub>
+...     <p:sibling/>
+...   </p:outer>
+... </root>'''
+>>> doc = xmltodict.parse(xml, process_namespaces=True, namespace_scope=True)
+>>> doc['root']['http://outer.example/:outer']['sub']['@xmlns:scope']
+{'p': 'http://inner.example/'}
+>>> subtree = {'http://outer.example/:outer':
+...            doc['root']['http://outer.example/:outer']}
+>>> print(xmltodict.unparse(subtree, expand_namespaces=True,
+...                         full_document=False))
+<p:outer xmlns:p="http://outer.example/"><sub xmlns:p="http://inner.example/"><p:inner></p:inner></sub><p:sibling></p:sibling></p:outer>
+```
+
+Note how the extracted subtree re-declares the inherited `p` binding on
+its new root, while the re-binding inside `<sub>` stays local and
+`<p:sibling>` keeps the outer namespace.
+
+To verify namespace fidelity programmatically, both `parse` and
+`unparse` accept `collect_expanded_names=True` and then return a
+`(result, expanded_names)` tuple, where `expanded_names` lists
+`('element', name)` / `('attribute', name)` pairs. Elements appear in
+document order with their own attributes recorded right after the
+element (xmlns declarations themselves are not reported). The sequence
+covers every element and attribute — parents, children, siblings and
+extracted subtrees alike — so input and output can be compared directly,
+or compared as multisets when repeated element names are re-grouped into
+lists by the dictionary round trip.
+
 ## Streaming mode
 
 `xmltodict` is very fast ([Expat](http://docs.python.org/library/pyexpat.html)-based) and has a streaming mode with a small memory footprint, suitable for big XML dumps like [Discogs](http://discogs.com/data/) or [Wikipedia](http://dumps.wikimedia.org/):
@@ -216,6 +265,9 @@ Parse XML input into a Python dictionary.
 - `dict_constructor=dict`: Constructor for dictionaries (e.g., dict).
 - `strip_whitespace=True`: Remove leading/trailing whitespace in text nodes. Default is True; this trims whitespace in text nodes. Set to False to preserve whitespace exactly. When `process_comments=True`, this same flag also trims comment text; disable `strip_whitespace` if you need to preserve comment indentation or padding. If you preserve whitespace text nodes, avoid combining this with `unparse(..., pretty=True)`: the preserved text nodes and pretty-print indentation/newlines will both be emitted.
 - `namespaces=None`: Mapping of namespaces to prefixes, or None to keep full URIs.
+- `namespace_scope=False`: With `process_namespaces=True`, attach an `@xmlns:scope` entry (the key can be renamed via `namespace_scope_key`) to every element holding namespace context. The entry maps each in-scope prefix to its URI at that element; the default namespace is the `''` key and an explicitly undeclared prefix (for example `xmlns=""`) maps to `None`. This keeps prefix re-bindings local to their subtree and lets an extracted subtree be serialized on its own.
+- `namespace_scope_key=None`: Dictionary key used for scope-preserving entries. Defaults to `attr_prefix + 'xmlns:scope'`.
+- `collect_expanded_names=False`: Return `(item, expanded_names)` instead of just the item. `expanded_names` is a list of `('element', name)` and `('attribute', name)` pairs in document order, using expanded names (with `process_namespaces=True`, `URI:local` form subject to the `namespaces` collapse map; without it, the raw lexical names).
 - `force_list=None`: Force list values for specific elements. Can be a boolean (True/False), a tuple of element names to force lists for, or a callable function that receives (path, key, value) and returns True/False. Useful for elements that may appear once or multiple times to ensure consistent list output.
 - `item_depth=0`: Depth at which to call `item_callback`.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
@@ -237,6 +289,9 @@ Convert a Python dictionary back into XML.
 - `indent='\t'`: Indentation string for pretty printing. May also be an integer number of spaces.
 - `newl='\n'`: Newline character for pretty printing.
 - `expand_iter=None`: Tag name to use for items in nested lists (breaks roundtripping).
+- `expand_namespaces=False`: Emit well-formed XML for expanded `URI:local` names even when the input dictionary has no matching `@xmlns` declarations, reusing prefixes already in scope (including `@xmlns:scope` entries) and generating declarations where needed. This makes prefix re-bindings stay local to their subtree and lets a subtree extracted from a larger document be serialized standalone. Prefix spelling may differ from the source as long as the expanded names stay identical.
+- `namespace_scope_key=None`: Key carrying scope-preserving entries produced by `parse(..., namespace_scope=True)`. Defaults to `attr_prefix + 'xmlns:scope'`; the entry itself is consumed and never written out as an attribute.
+- `collect_expanded_names=False`: Return `(xml, expanded_names)` instead of just the XML (when writing to a stream, only the list is returned). `expanded_names` is a list of `('element', name)` and `('attribute', name)` pairs in document order, using the expanded names found in the input dictionary.
 
 > **Note:** When building XML from dictionaries, keys whose values are empty
 > lists are skipped. For example, `{'a': []}` produces no `<a>` element. Add a

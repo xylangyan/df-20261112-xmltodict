@@ -716,6 +716,119 @@ def test_namespace_on_root_without_other_attrs():
     assert parse(xml, process_namespaces=True, namespaces=namespaces) == expected
 
 
+REBINDING_XML = """
+<root xmlns="http://default.example/" xmlns:p="http://outer.example/">
+  <p:outer p:ref="1">
+    <sub xmlns:p="http://inner.example/" xmlns="">
+      <p:inner plain="x" p:ia="v"/>
+    </sub>
+    <p:sibling/>
+  </p:outer>
+</root>
+"""
+
+
+def test_namespace_scope_keeps_rebinding_local_to_subtree():
+    parsed = parse(REBINDING_XML, process_namespaces=True, namespace_scope=True)
+    root = parsed['http://default.example/:root']
+    outer = root['http://outer.example/:outer']
+    sub = outer['sub']
+    assert sub['@xmlns:scope'] == {
+        '': None, 'p': 'http://inner.example/'}
+    # The sibling that follows the re-binding subtree still resolves against
+    # the outer binding.
+    assert 'http://outer.example/:sibling' in outer
+    assert 'http://inner.example/:sibling' not in outer
+    assert outer['http://outer.example/:sibling']['@xmlns:scope'] == {
+        '': 'http://default.example/', 'p': 'http://outer.example/'}
+
+
+def test_namespace_scope_handles_default_namespace_clearing():
+    parsed = parse(REBINDING_XML, process_namespaces=True, namespace_scope=True)
+    sub = parsed['http://default.example/:root'][
+        'http://outer.example/:outer']['sub']
+    assert sub['@xmlns'].get('') is None
+    assert sub['@xmlns:scope'][''] is None
+    assert 'http://inner.example/:inner' in sub
+
+
+def test_namespace_scope_unprefixed_attribute_stays_unqualified():
+    parsed = parse(REBINDING_XML, process_namespaces=True, namespace_scope=True)
+    inner = parsed['http://default.example/:root'][
+        'http://outer.example/:outer']['sub']['http://inner.example/:inner']
+    assert inner['@plain'] == 'x'
+    assert inner['@http://inner.example/:ia'] == 'v'
+
+
+def test_namespace_scope_disabled_by_default():
+    parsed = parse(REBINDING_XML, process_namespaces=True)
+    assert '@xmlns:scope' not in parsed['http://default.example/:root']
+
+
+def test_namespace_scope_honors_custom_attr_prefix():
+    xml = '<root xmlns:a="http://a.com/"><a:y/></root>'
+    parsed = parse(xml, process_namespaces=True, namespace_scope=True,
+                   attr_prefix='!')
+    assert parsed['root']['!xmlns:scope'] == {'a': 'http://a.com/'}
+    assert parsed['root']['!xmlns'] == {'a': 'http://a.com/'}
+
+
+def test_collect_expanded_names_includes_parent_child_siblings_and_attrs():
+    _, names = parse(REBINDING_XML, process_namespaces=True,
+                     namespace_scope=True, collect_expanded_names=True)
+    expected = [
+        ('element', 'http://default.example/:root'),
+        ('element', 'http://outer.example/:outer'),
+        ('attribute', 'http://outer.example/:ref'),
+        ('element', 'sub'),
+        ('element', 'http://inner.example/:inner'),
+        ('attribute', 'plain'),
+        ('attribute', 'http://inner.example/:ia'),
+        ('element', 'http://outer.example/:sibling'),
+    ]
+    assert names == expected
+
+
+def test_collect_expanded_names_without_namespace_processing():
+    parsed, names = parse('<a x="1"><b y="2"/></a>',
+                          collect_expanded_names=True)
+    assert parsed == {'a': {'@x': '1', 'b': {'@y': '2'}}}
+    assert names == [
+        ('element', 'a'), ('attribute', 'x'),
+        ('element', 'b'), ('attribute', 'y'),
+    ]
+
+
+def test_namespace_scope_in_streaming_items():
+    emitted = []
+
+    def handle(path, item):
+        emitted.append(item)
+        return True
+
+    parse(REBINDING_XML, process_namespaces=True, namespace_scope=True,
+          item_depth=2, item_callback=handle)
+    outer = emitted[0]
+    assert outer['@xmlns:scope'] == {
+        '': 'http://default.example/', 'p': 'http://outer.example/'}
+    assert outer['sub']['@xmlns:scope'] == {
+        '': None, 'p': 'http://inner.example/'}
+    assert outer['http://outer.example/:sibling']['@xmlns:scope'] == {
+        '': 'http://default.example/', 'p': 'http://outer.example/'}
+
+
+def test_namespace_scope_custom_key():
+    xml = '<root xmlns:a="http://a.com/"><a:y/></root>'
+    parsed = parse(xml, process_namespaces=True, namespace_scope=True,
+                   namespace_scope_key='@ns:scope')
+    assert parsed['root']['@ns:scope'] == {'a': 'http://a.com/'}
+    assert '@xmlns:scope' not in parsed['root']
+
+
+def test_collect_expanded_names_off_by_default():
+    assert parse('<a/>') == {'a': None}
+
+
 def test_force_list_true_applies_to_all_keys():
     xml = "<a><b>1</b><b>2</b><c>x</c></a>"
     expected = {"a": [{"b": ["1", "2"], "c": ["x"]}]}

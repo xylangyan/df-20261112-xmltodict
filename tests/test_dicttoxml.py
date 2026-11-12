@@ -321,6 +321,215 @@ xmlns:b="http://b.com/"><x a:attr="val">1</x><a:y>2</a:y><b:z>3</b:z></root>'''
     assert xml == expected_xml
 
 
+REBINDING_XML = '''<root xmlns="http://default.example/" xmlns:p="http://outer.example/">
+  <p:outer p:ref="1">
+    <sub xmlns:p="http://inner.example/" xmlns="">
+      <p:inner plain="x" p:ia="v"/>
+    </sub>
+    <p:sibling/>
+  </p:outer>
+</root>'''
+
+
+def _expanded(xml):
+    _, names = parse(xml, process_namespaces=True,
+                     collect_expanded_names=True)
+    return names
+
+
+def test_expand_namespaces_keeps_sibling_after_rebinding():
+    tree = parse(REBINDING_XML, process_namespaces=True, namespace_scope=True)
+    xml = unparse(tree, expand_namespaces=True, full_document=False)
+    assert _expanded(xml) == _expanded(REBINDING_XML)
+    reparsed = parse(xml, process_namespaces=True)
+    assert reparsed == parse(REBINDING_XML, process_namespaces=True)
+
+
+def test_expand_namespaces_outputs_default_namespace_clear():
+    tree = parse(REBINDING_XML, process_namespaces=True, namespace_scope=True)
+    xml = unparse(tree, expand_namespaces=True, full_document=False)
+    assert 'xmlns=""' in xml
+    # The cleared subtree must not fall back into the outer default namespace.
+    assert re.search(r'<sub[^>]*\bxmlns=""', xml)
+
+
+def test_expand_namespaces_unprefixed_attributes_stay_unqualified():
+    tree = parse(REBINDING_XML, process_namespaces=True, namespace_scope=True)
+    xml = unparse(tree, expand_namespaces=True, full_document=False)
+    assert re.search(r'<p:inner[^>]*\bplain="x"', xml)
+    reparsed = parse(xml, process_namespaces=True)
+    inner = reparsed['http://default.example/:root'][
+        'http://outer.example/:outer']['sub']['http://inner.example/:inner']
+    assert inner['@plain'] == 'x'
+    assert inner['@http://inner.example/:ia'] == 'v'
+
+
+def test_expand_namespaces_standalone_subtree():
+    tree = parse(REBINDING_XML, process_namespaces=True, namespace_scope=True)
+    subtree = {'http://outer.example/:outer':
+               tree['http://default.example/:root'][
+                   'http://outer.example/:outer']}
+    xml, output_names = unparse(
+        subtree, expand_namespaces=True, full_document=False,
+        collect_expanded_names=True)
+    # The extracted subtree must be well-formed on its own: inherited
+    # bindings are declared on the new root.
+    reparsed, input_names = parse(
+        xml, process_namespaces=True, namespace_scope=True,
+        collect_expanded_names=True)
+    assert output_names == input_names
+    assert reparsed['http://outer.example/:outer']['sub'][
+        'http://inner.example/:inner']['@plain'] == 'x'
+    assert ('element', 'http://outer.example/:sibling') in input_names
+
+
+def test_expand_namespaces_accepts_legacy_dict_input():
+    legacy = {
+        'http://outer.example/:outer': {
+            '@http://outer.example/:ref': '1',
+            'sub': {'http://inner.example/:inner': {'@plain': 'x'}},
+            'http://outer.example/:sibling': None,
+        },
+    }
+    xml, output_names = unparse(
+        legacy, expand_namespaces=True, full_document=False,
+        collect_expanded_names=True)
+    _, input_names = parse(xml, process_namespaces=True,
+                           collect_expanded_names=True)
+    assert output_names == input_names
+    assert parse(xml, process_namespaces=True)[
+        'http://outer.example/:outer']['sub'][
+            'http://inner.example/:inner']['@plain'] == 'x'
+
+
+def test_expand_namespaces_rebinds_same_prefix_per_subtree():
+    tree = parse(REBINDING_XML, process_namespaces=True, namespace_scope=True)
+    xml = unparse(tree, expand_namespaces=True, full_document=False,
+                  namespaces={'http://outer.example/': 'p',
+                              'http://inner.example/': 'p'})
+    assert re.search(r'<p:outer', xml)
+    assert re.search(r'<sub[^>]*xmlns:p="http://inner.example/"', xml)
+    assert re.search(r'</sub><p:sibling', xml)
+    assert parse(xml, process_namespaces=True) == parse(
+        REBINDING_XML, process_namespaces=True)
+
+
+def test_unparse_collect_expanded_names_reports_each_list_item():
+    tree = {'a': {'b': [{'@x': '1'}, {'@x': '2'}]}}
+    _, names = unparse(tree, full_document=False,
+                       collect_expanded_names=True)
+    assert names == [
+        ('element', 'a'),
+        ('element', 'b'), ('attribute', 'x'),
+        ('element', 'b'), ('attribute', 'x'),
+    ]
+
+
+def test_unparse_collect_expanded_names_returns_list_with_output_stream():
+    from io import StringIO
+    stream = StringIO()
+    names = unparse({'a': {'b': 'x'}}, output=stream,
+                    full_document=False, collect_expanded_names=True)
+    assert names == [('element', 'a'), ('element', 'b')]
+    assert stream.getvalue() == '<a><b>x</b></a>'
+
+
+def test_unparse_without_collect_returns_none_with_output_stream():
+    from io import StringIO
+    stream = StringIO()
+    result = unparse({'a': 'x'}, output=stream, full_document=False)
+    assert result is None
+    assert stream.getvalue() == '<a>x</a>'
+
+
+def test_expand_namespaces_does_not_emit_scope_annotation_key():
+    tree = parse(REBINDING_XML, process_namespaces=True, namespace_scope=True)
+    xml = unparse(tree, expand_namespaces=True, full_document=False)
+    assert 'xmlns:scope' not in xml
+
+
+def test_expand_namespaces_declares_prefix_for_namespaced_attribute():
+    legacy = {'c': {'@http://a.com/:q': '1'}}
+    xml = unparse(legacy, expand_namespaces=True, full_document=False)
+    reparsed = parse(xml, process_namespaces=True)
+    assert reparsed['c']['@http://a.com/:q'] == '1'
+
+
+def test_expand_namespaces_rejects_invalid_scope_prefix():
+    tree = {'a': {'@xmlns:scope': {'bad/prefix': 'http://a.com/'},
+                  'http://a.com/:b': None}}
+    with pytest.raises(ValueError):
+        unparse(tree, expand_namespaces=True, full_document=False)
+
+
+def test_expand_namespaces_honors_custom_attr_prefix():
+    tree = parse(REBINDING_XML, process_namespaces=True, namespace_scope=True,
+                 attr_prefix='!')
+    xml = unparse(tree, expand_namespaces=True, attr_prefix='!',
+                  full_document=False)
+    assert parse(xml, process_namespaces=True) == parse(
+        REBINDING_XML, process_namespaces=True)
+
+
+def test_expand_namespaces_namespaced_attribute_never_uses_empty_prefix():
+    # The only binding for the attribute's namespace is the default one;
+    # attributes cannot take it, so a real prefix must be generated.
+    tree = {
+        'el': {
+            '@xmlns:scope': {'': 'http://u1.example/'},
+            'http://u1.example/:child': {'@http://u1.example/:q': 'v'},
+        },
+    }
+    xml = unparse(tree, expand_namespaces=True, full_document=False)
+    # No empty-prefix attribute (which would render as ` :q="v"`).
+    assert re.search(r'\s:[\w.-]+=', xml) is None
+    reparsed = parse(xml, process_namespaces=True)
+    root = reparsed['http://u1.example/:el']
+    assert root['http://u1.example/:child'][
+        '@http://u1.example/:q'] == 'v'
+
+
+def test_expand_namespaces_uri_containing_separator():
+    # A URN contains the namespace separator itself; splitting the expanded
+    # name must still recover the full URI.
+    tree = {
+        'urn:a:b:root': {
+            '@xmlns:scope': {'': 'urn:a:b'},
+            'urn:a:b:child': {'@urn:a:b:attr': 'v'},
+        },
+    }
+    xml = unparse(tree, expand_namespaces=True, full_document=False)
+    reparsed = parse(xml, process_namespaces=True)
+    assert reparsed['urn:a:b:root']['urn:a:b:child'][
+        '@urn:a:b:attr'] == 'v'
+
+
+def test_expand_namespaces_plain_element_ignores_inherited_default():
+    # A plain element must stay unqualified even though its parent's default
+    # namespace binding is still inherited; it clears the default namespace.
+    tree = {
+        'http://u3.example/:el': {
+            '@xmlns:scope': {'': 'http://u3.example/'},
+            'el': {'@xmlns:scope': {'': None}},
+            'http://u3.example/:sibling': {
+                '@xmlns:scope': {'': 'http://u3.example/'},
+            },
+        },
+    }
+    xml, names = unparse(tree, expand_namespaces=True, full_document=False,
+                         collect_expanded_names=True)
+    assert names == [
+        ('element', 'http://u3.example/:el'),
+        ('element', 'el'),
+        ('element', 'http://u3.example/:sibling'),
+    ]
+    assert 'xmlns=""' in xml
+    reparsed = parse(xml, process_namespaces=True)
+    assert reparsed['http://u3.example/:el']['el'] == {'@xmlns': {'': None}}
+    assert reparsed['http://u3.example/:el'][
+        'http://u3.example/:sibling'] is None
+
+
 def test_xmlns_values_use_consistent_boolean_coercion():
     xml = unparse({"root": {"@xmlns": {"a": True}}}, full_document=False)
     assert xml == '<root xmlns:a="true"></root>'

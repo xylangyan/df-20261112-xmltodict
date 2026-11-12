@@ -12,6 +12,37 @@ class ParsingInterrupted(Exception):
     pass
 
 
+class _NamespaceScope(dict):
+    """A prefix->URI namespace scope: the current bindings plus a change log.
+
+    Behaves like a plain dict of the bindings in effect, while `declared`
+    records the bindings that were introduced at the element that opened this
+    scope (so they can be replayed when the subtree is serialized on its
+    own). `undeclared` records prefixes that were explicitly unbound at that
+    element (e.g. ``xmlns=""``), which XML 1.0 serializers cannot express and
+    which therefore must not be re-declared.
+    """
+
+    def __init__(self, bindings=(), declared=(), undeclared=()):
+        super().__init__(bindings)
+        self.declared = dict(declared)
+        self.undeclared = set(undeclared)
+
+    def child(self, declarations):
+        declared = {}
+        undeclared = set()
+        for prefix, uri in declarations.items():
+            if uri is None:
+                undeclared.add(prefix)
+            else:
+                declared[prefix] = uri
+        child_scope = _NamespaceScope(self, declared, undeclared)
+        child_scope.update(declared)
+        for prefix in undeclared:
+            child_scope.pop(prefix, None)
+        return child_scope
+
+
 class _DictSAXHandler:
     def __init__(
         self,
@@ -29,6 +60,10 @@ class _DictSAXHandler:
         namespaces=None,
         force_list=None,
         comment_key="#comment",
+        namespace_scope=False,
+        namespace_scope_key=None,
+        collect_expanded_names=False,
+        process_namespaces=False,
     ):
         self.path = []
         self.stack = []
@@ -49,6 +84,49 @@ class _DictSAXHandler:
         self.namespace_declarations = dict_constructor()
         self.force_list = force_list
         self.comment_key = comment_key
+        self.namespace_scope = namespace_scope
+        if namespace_scope_key is None:
+            namespace_scope_key = attr_prefix + 'xmlns:scope'
+        self.namespace_scope_key = namespace_scope_key
+        if namespace_scope_key.startswith(attr_prefix):
+            self.namespace_scope_attr_key = namespace_scope_key[
+                len(attr_prefix):]
+        else:
+            self.namespace_scope_attr_key = namespace_scope_key
+        self.collect_expanded_names = collect_expanded_names
+        self.process_namespaces = process_namespaces
+        self.namespace_scopes = []
+        self.expanded_names = []
+
+    @property
+    def current_namespace_scope(self):
+        if self.namespace_scopes:
+            return self.namespace_scopes[-1]
+        return _NamespaceScope()
+
+    def _push_namespace_scope(self):
+        scope = self.current_namespace_scope.child(
+            self.namespace_declarations)
+        self.namespace_declarations = self.dict_constructor()
+        self.namespace_scopes.append(scope)
+        return scope
+
+    def _scope_annotation(self, scope):
+        if not self.namespace_scope:
+            return None
+        if not (scope or scope.declared or scope.undeclared):
+            return None
+        annotation = self.dict_constructor(scope)
+        for prefix in scope.undeclared:
+            annotation[prefix] = None
+        return annotation
+
+    def _pop_namespace_scope(self):
+        self.namespace_scopes.pop()
+
+    def _record_expanded_name(self, kind, expanded_name):
+        if self.collect_expanded_names:
+            self.expanded_names.append((kind, expanded_name))
 
     def _build_name(self, full_name):
         if self.namespaces is None:
@@ -75,13 +153,34 @@ class _DictSAXHandler:
         self.namespace_declarations[prefix or ''] = uri
 
     def startElement(self, full_name, attrs):
-        name = self._build_name(full_name)
+        # With namespace processing enabled Expat already hands us expanded
+        # names (URI + separator + localname), so `full_name` is exactly the
+        # expanded name we want to record. Unprefixed attributes are reported
+        # without the default namespace, which is also correct.
+        self._record_expanded_name('element', full_name)
+        namespace_declarations = self.namespace_declarations
+        if self.process_namespaces and self.namespace_scope:
+            scope = self._push_namespace_scope()
+            name = self._build_name(full_name)
+        else:
+            scope = None
+            name = self._build_name(full_name)
         attrs = self._attrs_to_dict(attrs)
-        if self.namespace_declarations:
+        for key in attrs:
+            if key == 'xmlns' or key.startswith('xmlns:'):
+                continue
+            self._record_expanded_name('attribute', self._build_name(key))
+        if namespace_declarations:
             if not attrs:
                 attrs = self.dict_constructor()
-            attrs['xmlns'] = self.namespace_declarations
+            attrs['xmlns'] = namespace_declarations
             self.namespace_declarations = self.dict_constructor()
+        if scope is not None:
+            scope_annotation = self._scope_annotation(scope)
+            if scope_annotation is not None:
+                if not attrs:
+                    attrs = self.dict_constructor()
+                attrs[self.namespace_scope_attr_key] = scope_annotation
         self.path.append((name, attrs or None))
         if len(self.path) >= self.item_depth:
             self.stack.append((self.item, self.data))
@@ -131,6 +230,8 @@ class _DictSAXHandler:
                 self.item = None
                 self.data = []
             self.path.pop()
+            if self.namespace_scopes:
+                self._pop_namespace_scope()
             return
         if self.stack:
             data = (None if not self.data
@@ -151,6 +252,8 @@ class _DictSAXHandler:
             self.item = None
             self.data = []
         self.path.pop()
+        if self.namespace_scopes:
+            self._pop_namespace_scope()
 
     def characters(self, data):
         if not self.data:
@@ -206,7 +309,9 @@ class _DictSAXHandler:
 
 
 def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
-          namespace_separator=':', disable_entities=True, process_comments=False, **kwargs):
+          namespace_separator=':', disable_entities=True, process_comments=False,
+          namespace_scope=False, namespace_scope_key=None,
+          collect_expanded_names=False, **kwargs):
     """Parse the given XML input and convert it into a dictionary.
 
     `xml_input` can either be a `string`, a file-like object, or a generator of strings.
@@ -342,8 +447,31 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         at the default `True`, comments will have leading and trailing
         whitespace removed. Disable `strip_whitespace` to keep comment
         indentation or padding intact.
+
+    With `process_namespaces=True`, `namespace_scope=True` additionally
+    attaches a scope-preserving entry to every element that carries namespace
+    context. The entry lives under `namespace_scope_key` (default
+    `'@xmlns:scope'`) and maps each in-scope prefix to its URI at that
+    element (the default namespace is the `''` key; explicitly undeclared
+    prefixes such as ``xmlns=""`` map to `None`). This keeps prefix
+    re-bindings local to their subtree, so sibling elements after a
+    re-binding element keep their original namespace, and a subtree can be
+    serialized on its own with `unparse(..., expand_namespaces=True)`.
+
+    With `collect_expanded_names=True`, `parse` returns a
+    ``(item, expanded_names)`` tuple instead of just the item, where
+    `expanded_names` is a list of ``(kind, name)`` pairs: an
+    ``('element', name)`` entry for every element, in document order,
+    followed by ``('attribute', name)`` entries for that element's
+    attributes (xmlns declarations are not reported). Names use expanded
+    form (``URI:local``) with `process_namespaces=True`, subject to the
+    `namespaces` collapse map, or raw lexical names without it.
     """
     handler = _DictSAXHandler(namespace_separator=namespace_separator,
+                              process_namespaces=process_namespaces,
+                              namespace_scope=namespace_scope,
+                              namespace_scope_key=namespace_scope_key,
+                              collect_expanded_names=collect_expanded_names,
                               **kwargs)
     if isinstance(xml_input, str):
         encoding = encoding or 'utf-8'
@@ -375,6 +503,8 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         parser.Parse(b'', True)
     else:
         parser.Parse(xml_input, True)
+    if collect_expanded_names:
+        return handler.item, list(handler.expanded_names)
     return handler.item
 
 
@@ -447,6 +577,91 @@ def _process_namespace(name, namespaces, ns_sep=':', attr_prefix='@'):
     return name
 
 
+def _split_expanded_name(name, attr_prefix='@', namespace_separator=':'):
+    """Split an element/attribute name into (uri, local).
+
+    Attribute-prefixed keys are accepted and returned without their
+    `attr_prefix`. Returns (None, local) for names that are not
+    namespace-expanded.
+    """
+    if not isinstance(name, str):
+        return None, name
+    stripped = name
+    if stripped.startswith(attr_prefix):
+        stripped = stripped[len(attr_prefix):]
+    if namespace_separator not in stripped:
+        return None, stripped
+    uri, local = stripped.rsplit(namespace_separator, 1)
+    if not uri:
+        return None, stripped
+    return uri, local
+
+
+def _resolve_lexical_name(name, prefix_scope, attr_prefix='@',
+                          namespace_separator=':'):
+    """Resolve a name that may use a prefix bound in the current scope.
+
+    Returns (uri, local, prefix). Expanded names (``URI:local``) and
+    prefixed names bound in `prefix_scope` are supported. Plain names
+    (without the namespace separator) are never namespaced, even when a
+    default namespace is in scope: plain attributes ignore the default
+    namespace by spec, and a plain element name means "no namespace".
+    """
+    stripped = name[len(attr_prefix):] if isinstance(name, str) and \
+        name.startswith(attr_prefix) else name
+    if not isinstance(stripped, str) or \
+            namespace_separator not in stripped:
+        return None, stripped, None
+    prefix, local = stripped.split(namespace_separator, 1)
+    if not prefix:
+        return None, local, None
+    if prefix in prefix_scope:
+        return prefix_scope[prefix], local, prefix
+    # Not a bound lexical prefix. An expanded name can be told apart from a
+    # bare lexical prefix because URIs contain '/' or additional separators.
+    if '/' in stripped or stripped.count(namespace_separator) > 1:
+        uri, expanded_local = _split_expanded_name(
+            name, attr_prefix, namespace_separator)
+        return uri, expanded_local, None
+    # An unbound lexical prefix: leave the name alone.
+    return None, stripped, None
+
+
+def _prefix_for_uri(uri, prefix_scope, allow_default=True):
+    """Find a prefix already bound to `uri` in the current scope.
+
+    Attribute names cannot use the default namespace, so callers resolving
+    attributes pass `allow_default=False`.
+    """
+    for prefix, bound_uri in prefix_scope.items():
+        if bound_uri == uri and (prefix or allow_default):
+            return prefix
+    return None
+
+
+def _select_prefix(uri, namespaces, used_prefixes, allow_default=False):
+    """Choose an output prefix for `uri`, avoiding used prefixes.
+
+    Element names may use the default namespace (empty prefix) when the
+    `namespaces` map says so; attribute names always need a real prefix.
+    Generated names are stable across a document because `used_prefixes`
+    keeps every prefix taken so far.
+    """
+    preferred = namespaces.get(uri) if namespaces else None
+    if preferred == '' and allow_default:
+        return ''
+    candidates = [preferred] if preferred else []
+    candidates.extend(
+        'ns{}'.format(index) for index in range(len(used_prefixes) + 1))
+    for prefix in candidates:
+        if prefix and prefix not in used_prefixes:
+            used_prefixes.add(prefix)
+            return prefix
+    prefix = 'ns{}'.format(len(used_prefixes) + 1)
+    used_prefixes.add(prefix)
+    return prefix
+
+
 def _emit(key, value, content_handler,
           attr_prefix='@',
           cdata_key='#text',
@@ -461,7 +676,20 @@ def _emit(key, value, content_handler,
           expand_iter=None,
           encoding='utf-8',
           bytes_errors='replace',
-          comment_key='#comment'):
+          comment_key='#comment',
+          expand_namespaces=False,
+          namespace_scope_key=None,
+          prefix_scope=None,
+          used_prefixes=None,
+          expanded_names=None):
+    if namespace_scope_key is None:
+        namespace_scope_key = attr_prefix + 'xmlns:scope'
+    elif not namespace_scope_key.startswith(attr_prefix):
+        namespace_scope_key = attr_prefix + namespace_scope_key
+    if prefix_scope is None:
+        prefix_scope = {}
+    if used_prefixes is None:
+        used_prefixes = set()
     if isinstance(key, str) and key == comment_key:
         comments_list = value if isinstance(value, list) else [value]
         if isinstance(indent, int):
@@ -481,14 +709,16 @@ def _emit(key, value, content_handler,
                 content_handler.ignorableWhitespace(newl)
         return
 
-    key = _process_namespace(key, namespaces, namespace_separator, attr_prefix)
+    if not expand_namespaces:
+        key = _process_namespace(key, namespaces, namespace_separator, attr_prefix)
     if preprocessor is not None:
         result = preprocessor(key, value)
         if result is None:
             return
         key, value = result
     # Minimal validation to avoid breaking out of tag context
-    _validate_name(key, "element")
+    if not expand_namespaces:
+        _validate_name(key, "element")
     if not hasattr(value, '__iter__') or isinstance(value, (str, bytes, bytearray, memoryview, dict)):
         value = [value]
     for index, v in enumerate(value):
@@ -503,6 +733,99 @@ def _emit(key, value, content_handler,
                 v = _convert_value_to_string(v, encoding=encoding, bytes_errors=bytes_errors)
         if isinstance(v, str):
             v = {cdata_key: v}
+        scanned_decls = {}
+        scope_annotation = None
+        for ik, iv in v.items():
+            if isinstance(ik, str) and ik.startswith(attr_prefix):
+                if ik == attr_prefix + 'xmlns' and isinstance(iv, dict):
+                    for prefix, uri in iv.items():
+                        _validate_name(prefix, "attribute")
+                        attr = 'xmlns{}'.format(f':{prefix}' if prefix else '')
+                        scanned_decls[attr] = '' if uri is None else _convert_value_to_string(
+                            uri, encoding=encoding, bytes_errors=bytes_errors)
+                elif ik == namespace_scope_key and isinstance(iv, dict):
+                    scope_annotation = iv
+        current_scope = dict(prefix_scope)
+        for attr, value in scanned_decls.items():
+            prefix = attr[len('xmlns:'):] if attr.startswith('xmlns:') else ''
+            if value:
+                current_scope[prefix] = value
+            else:
+                current_scope.pop(prefix, None)
+        annotation_decls = {}
+        if scope_annotation:
+            for prefix, uri in scope_annotation.items():
+                _validate_name(prefix, "attribute")
+                if uri is None:
+                    if current_scope.get(prefix) is not None:
+                        annotation_decls[
+                            'xmlns' if not prefix else 'xmlns:' + prefix] = ''
+                    current_scope.pop(prefix, None)
+                else:
+                    value = _convert_value_to_string(
+                        uri, encoding=encoding, bytes_errors=bytes_errors)
+                    if current_scope.get(prefix) != value:
+                        annotation_decls[
+                            'xmlns' if not prefix else 'xmlns:' + prefix] = value
+                    current_scope[prefix] = value
+        element_uri, element_local, lexical_prefix = _resolve_lexical_name(
+            key, current_scope, attr_prefix, namespace_separator)
+        if expanded_names is not None and isinstance(key, str):
+            if expand_namespaces and element_uri:
+                expanded_names.append(('element', element_uri +
+                                       namespace_separator + element_local))
+            else:
+                expanded_names.append(('element', key))
+        element_key = key
+        element_prefix_used = lexical_prefix
+        per_element_decls = {}
+        decls = {}
+
+        def ensure_decl(prefix, uri):
+            if not prefix or not uri:
+                return
+            attr = 'xmlns:' + prefix
+            if attr in decls or attr in per_element_decls:
+                return
+            if prefix_scope.get(prefix) == uri:
+                return
+            per_element_decls[attr] = uri
+            current_scope[prefix] = uri
+            used_prefixes.add(prefix)
+        if expand_namespaces:
+            if element_uri:
+                preferred = namespaces.get(element_uri) if namespaces else None
+                if preferred == '':
+                    element_prefix_used = ''
+                    element_key = element_local
+                else:
+                    if preferred:
+                        element_prefix_used = preferred
+                    elif element_prefix_used is None:
+                        element_prefix_used = _prefix_for_uri(
+                            element_uri, current_scope)
+                    if element_prefix_used is None:
+                        element_prefix_used = _select_prefix(
+                            element_uri, None, used_prefixes,
+                            allow_default=False)
+                    if element_prefix_used:
+                        element_key = element_prefix_used + \
+                            namespace_separator + element_local
+                    else:
+                        element_key = element_local
+        else:
+            if element_prefix_used is None and element_uri and namespaces:
+                preferred = namespaces.get(element_uri)
+                if preferred:
+                    element_prefix_used = preferred
+            element_key = key
+        if expand_namespaces and element_uri:
+            if element_prefix_used:
+                ensure_decl(element_prefix_used, element_uri)
+            elif current_scope.get('') != element_uri:
+                per_element_decls['xmlns'] = element_uri
+                current_scope[''] = element_uri
+        _validate_name(element_key, "element")
         cdata = None
         attrs = {}
         children = []
@@ -514,16 +837,48 @@ def _emit(key, value, content_handler,
                     cdata = _convert_value_to_string(iv, encoding=encoding, bytes_errors=bytes_errors)
                 continue
             if isinstance(ik, str) and ik.startswith(attr_prefix):
-                ik = _process_namespace(ik, namespaces, namespace_separator,
-                                        attr_prefix)
+                if ik == namespace_scope_key and isinstance(iv, dict):
+                    for attr_name, attr_value in annotation_decls.items():
+                        decls[attr_name] = attr_value
+                        attrs[attr_name] = attr_value
+                    continue
                 if ik == attr_prefix + 'xmlns' and isinstance(iv, dict):
                     for k, v in iv.items():
                         _validate_name(k, "attribute")
                         attr = 'xmlns{}'.format(f':{k}' if k else '')
-                        attrs[attr] = '' if v is None else _convert_value_to_string(
+                        value = '' if v is None else _convert_value_to_string(
                             v, encoding=encoding, bytes_errors=bytes_errors
                         )
+                        decls[attr] = value
+                        attrs[attr] = value
                     continue
+                if expand_namespaces:
+                    attr_uri, attr_local, attr_lexical = _resolve_lexical_name(
+                        ik, current_scope, attr_prefix, namespace_separator)
+                    if expanded_names is not None:
+                        expanded_names.append((
+                            'attribute',
+                            attr_uri + namespace_separator + attr_local
+                            if attr_uri else attr_local))
+                    if attr_uri:
+                        attr_prefix_used = attr_lexical
+                        if attr_prefix_used is None:
+                            attr_prefix_used = _prefix_for_uri(
+                                attr_uri, current_scope,
+                                allow_default=False)
+                        if attr_prefix_used is None:
+                            attr_prefix_used = _select_prefix(
+                                attr_uri, None, used_prefixes)
+                        ensure_decl(attr_prefix_used, attr_uri)
+                        ik = attr_prefix + attr_prefix_used + \
+                            namespace_separator + attr_local
+                else:
+                    if expanded_names is not None:
+                        recorded = ik[len(attr_prefix):] if ik.startswith(
+                            attr_prefix) else ik
+                        expanded_names.append(('attribute', recorded))
+                    ik = _process_namespace(ik, namespaces, namespace_separator,
+                                            attr_prefix)
                 if iv is None:
                     iv = ''
                 elif not isinstance(iv, str):
@@ -539,7 +894,10 @@ def _emit(key, value, content_handler,
             indent = ' ' * indent
         if pretty:
             content_handler.ignorableWhitespace(depth * indent)
-        content_handler.startElement(key, AttributesImpl(attrs))
+        if per_element_decls:
+            for attr_name, attr_value in per_element_decls.items():
+                attrs.setdefault(attr_name, attr_value)
+        content_handler.startElement(element_key, AttributesImpl(attrs))
         if pretty and children:
             content_handler.ignorableWhitespace(newl)
         for child_key, child_value in children:
@@ -548,12 +906,17 @@ def _emit(key, value, content_handler,
                   pretty, newl, indent, namespaces=namespaces,
                   namespace_separator=namespace_separator,
                   expand_iter=expand_iter, encoding=encoding,
-                  bytes_errors=bytes_errors, comment_key=comment_key)
+                  bytes_errors=bytes_errors, comment_key=comment_key,
+                  expand_namespaces=expand_namespaces,
+                  namespace_scope_key=namespace_scope_key,
+                  prefix_scope=current_scope,
+                  used_prefixes=used_prefixes,
+                  expanded_names=expanded_names)
         if cdata is not None:
             content_handler.characters(cdata)
         if pretty and children:
             content_handler.ignorableWhitespace(depth * indent)
-        content_handler.endElement(key)
+        content_handler.endElement(element_key)
         if pretty and depth:
             content_handler.ignorableWhitespace(newl)
 
@@ -566,7 +929,8 @@ class _XMLGenerator(XMLGenerator):
 
 def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
             short_empty_elements=False, comment_key='#comment',
-            **kwargs):
+            expand_namespaces=False, namespace_scope_key=None,
+            collect_expanded_names=False, **kwargs):
     """Emit an XML document for the given `input_dict` (reverse of `parse`).
 
     The resulting XML document is returned as a string, but if `output` (a
@@ -586,6 +950,21 @@ def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
     The `bytes_errors` parameter controls decoding errors for byte values and
     defaults to `'replace'`.
 
+    With `expand_namespaces=True`, element and attribute names using expanded
+    namespace names (``URI:local``) or scope-aware prefixes are serialized
+    well-formed even when the input dictionary carries no matching ``@xmlns``
+    declarations: the declarations they need are emitted automatically. This
+    makes it safe to serialize a subtree extracted from a larger document.
+    Prefixes already in scope (including those carried by the scope-preserving
+    entry written by `parse(..., namespace_scope=True)`, keyed by
+    `namespace_scope_key`, default `'@xmlns:scope'`) are reused, so explicit
+    prefix re-bindings stay local to their subtree.
+
+    With `collect_expanded_names=True`, `unparse` returns an
+    ``(xml, expanded_names)`` tuple, where `expanded_names` is a list of
+    ``(kind, name)`` pairs in document order: ``('element', name)`` for each
+    element and ``('attribute', name)`` for each attribute, using expanded
+    names from the input dictionary.
     """
     bytes_errors = kwargs.pop('bytes_errors', 'replace')
     try:
@@ -603,6 +982,12 @@ def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
         content_handler = _XMLGenerator(output, encoding)
     if full_document:
         content_handler.startDocument()
+    namespaces = kwargs.get('namespaces')
+    used_prefixes = set()
+    if namespaces:
+        used_prefixes = {
+            prefix for prefix in namespaces.values() if prefix}
+    expanded_names = [] if collect_expanded_names else None
     seen_root = False
     for key, value in input_dict.items():
         if key != comment_key and full_document and seen_root:
@@ -615,6 +1000,10 @@ def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
             encoding=encoding,
             bytes_errors=bytes_errors,
             comment_key=comment_key,
+            expand_namespaces=expand_namespaces,
+            namespace_scope_key=namespace_scope_key,
+            used_prefixes=used_prefixes,
+            expanded_names=expanded_names,
             **kwargs,
         )
         if key != comment_key:
@@ -629,7 +1018,12 @@ def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
             value = value.decode(encoding)
         except AttributeError:  # pragma no cover
             pass
+        if collect_expanded_names:
+            return value, expanded_names
         return value
+    if collect_expanded_names:
+        return expanded_names
+    return None
 
 
 if __name__ == '__main__':  # pragma: no cover
