@@ -92,6 +92,17 @@ Chris Potter
 ...
 ```
 
+For a pull-based pipeline, `xmltodict.parse_items` yields the same `(path, item)`
+pairs on demand instead of invoking a callback. It reads only as far as needed to
+produce the next requested item, never closes the caller-owned source, and lets
+parse errors surface after all preceding items have been yielded:
+
+```python
+>>> for path, artist in xmltodict.parse_items(GzipFile('discogs_artists.xml.gz'),
+...                                           item_depth=2):
+...     process(artist)
+```
+
 It can also be used from the command line to pipe objects to a script like this:
 
 ```python
@@ -219,6 +230,15 @@ Parse XML input into a Python dictionary.
 - `force_list=None`: Force list values for specific elements. Can be a boolean (True/False), a tuple of element names to force lists for, or a callable function that receives (path, key, value) and returns True/False. Useful for elements that may appear once or multiple times to ensure consistent list output.
 - `item_depth=0`: Depth at which to call `item_callback`.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
+
+### xmltodict.parse_items()
+
+Pull-based streaming: returns a generator of `(path, item)` tuples for elements at `item_depth`, in document order, with the same `path` (including ancestor attributes) and namespace handling as `parse` streaming mode. Accepts a string, a caller-owned file-like object, or a one-shot iterable of chunks. A chunk is read only while no item is pending, so nothing is read beyond the next requested item (`chunk_size=8192` bounds each file read). The source is never closed: on explicit `close()`, end of input, or a parse error, the caller remains responsible for cleanup. A malformed document raises `expat.ExpatError`, but only after every item parsed before the error has been yielded.
+
+- `xml_input`: String, file-like object, or iterable of chunks.
+- `item_depth`: Depth of the elements to yield (must be at least 1).
+- `chunk_size=8192`: Read size used for file-like inputs.
+- Accepts the same parsing options as `xmltodict.parse()` (`process_namespaces`, `namespaces`, `postprocessor`, `force_list`, etc.).
 - `comment_key='#comment'`: Key used for XML comments when `process_comments=True`. Only used when `process_comments=True`. Comments can be preserved but multiple top-level comments may not retain order.
 
 ### xmltodict.unparse()

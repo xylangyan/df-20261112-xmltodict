@@ -1,9 +1,9 @@
-from xmltodict import parse, ParsingInterrupted
+from xmltodict import parse, parse_items, ParsingInterrupted
 import collections
 import pytest
 from io import BytesIO
 
-from xml.parsers.expat import ParserCreate
+from xml.parsers.expat import ParserCreate, ExpatError
 from xml.parsers import expat
 
 
@@ -720,3 +720,126 @@ def test_force_list_true_applies_to_all_keys():
     xml = "<a><b>1</b><b>2</b><c>x</c></a>"
     expected = {"a": [{"b": ["1", "2"], "c": ["x"]}]}
     assert parse(xml, force_list=True) == expected
+
+
+class _RecordingInput:
+    """Fake input that records every read request made against it."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.read_log = []
+        self.closed = False
+
+    def read(self, size=-1):
+        self.read_log.append(size)
+        if not self._chunks:
+            return b''
+        return self._chunks.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+def test_parse_items_matches_push_mode():
+    # order, path ancestor attributes and items match the push-style API
+    xml = ('<a x="y">'
+           '<b i="1"><c>u</c>tail</b>'
+           '<b i="2">text</b>'
+           '<b i="3"/>'
+           '</a>')
+    pushed = []
+    parse(xml, item_depth=2,
+          item_callback=lambda path, item: pushed.append((list(path), item)) or True)
+    pulled = list(parse_items(xml, item_depth=2))
+    assert pulled == pushed
+    assert pulled == [
+        ([('a', {'x': 'y'}), ('b', {'i': '1'})], {'@i': '1', 'c': 'u', '#text': 'tail'}),
+        ([('a', {'x': 'y'}), ('b', {'i': '2'})], {'@i': '2', '#text': 'text'}),
+        ([('a', {'x': 'y'}), ('b', {'i': '3'})], {'@i': '3'}),
+    ]
+
+
+def test_parse_items_namespaces_match_push_mode():
+    xml = ('<root xmlns="http://defaultns.com/" xmlns:a="http://a.com/" version="1">'
+           '<x a:attr="val">1</x><a:y>2</a:y></root>')
+    namespaces = {'http://defaultns.com/': '', 'http://a.com/': 'ns_a'}
+    pushed = []
+    parse(xml, item_depth=2, process_namespaces=True, namespaces=namespaces,
+          item_callback=lambda path, item: pushed.append((list(path), item)) or True)
+    pulled = list(parse_items(xml, item_depth=2, process_namespaces=True,
+                              namespaces=namespaces))
+    assert pulled == pushed
+    assert pulled == [
+        ([('root', {'version': '1',
+                    'xmlns': {'': 'http://defaultns.com/', 'a': 'http://a.com/'}}),
+          ('x', {'http://a.com/:attr': 'val'})],
+         {'@ns_a:attr': 'val', '#text': '1'}),
+        ([('root', {'version': '1',
+                    'xmlns': {'': 'http://defaultns.com/', 'a': 'http://a.com/'}}),
+          ('ns_a:y', None)],
+         '2'),
+    ]
+
+
+def test_parse_items_one_then_close():
+    # take a single item, then close: no further reads happen and the
+    # caller-owned source is left untouched (never closed by the library)
+    source = _RecordingInput([
+        b'<a x="y"><b>1</b>',
+        b'<b>2</b>',
+        b'<b>3</b></a>',
+    ])
+    items = parse_items(source, item_depth=2)
+    path, item = next(items)
+    assert path == [('a', {'x': 'y'}), ('b', None)]
+    assert item == '1'
+    items.close()
+    assert source.read_log == [8192]
+    assert not source.closed
+    source.close()  # caller is responsible for cleanup
+    assert source.closed
+
+
+def test_parse_items_error_on_bad_tail():
+    # items parsed before the malformed tail are yielded first; the parse
+    # error surfaces on the following request, and the source is not closed
+    source = _RecordingInput([
+        b'<a><b>1</b>',
+        b'<b>2</b>',
+        b'</a><oops',
+    ])
+    items = parse_items(source, item_depth=2)
+    assert next(items) == ([('a', None), ('b', None)], '1')
+    assert next(items) == ([('a', None), ('b', None)], '2')
+    with pytest.raises(ExpatError):
+        next(items)
+    assert source.read_log == [8192, 8192, 8192]
+    assert not source.closed
+
+
+def test_parse_items_chunked_source_reads_on_demand():
+    # a one-shot chunk iterator is only advanced while no item is pending
+    chunks = iter([b'<a><b>1</b>', b'<b>2</b>', b'<b>3</b></a>'])
+    items = parse_items(chunks, item_depth=2)
+    assert next(items)[1] == '1'
+    assert next(items)[1] == '2'
+    assert next(items)[1] == '3'
+    with pytest.raises(StopIteration):
+        next(items)
+
+
+def test_parse_items_file_object_chunk_size():
+    source = _RecordingInput([b'<a><b>1</b><b>2</b></a>'])
+    items = parse_items(source, item_depth=2, chunk_size=4)
+    assert next(items)[1] == '1'
+    assert source.read_log == [4]
+    assert next(items)[1] == '2'
+    with pytest.raises(StopIteration):
+        next(items)
+    assert source.read_log == [4, 4]
+    assert not source.closed
+
+
+def test_parse_items_requires_positive_depth():
+    with pytest.raises(ValueError):
+        parse_items('<a><b>1</b></a>', item_depth=0)

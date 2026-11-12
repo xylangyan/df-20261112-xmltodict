@@ -205,6 +205,30 @@ class _DictSAXHandler:
             return self.force_cdata(self.path[:-1], key, value)
 
 
+def _make_expat_parser(handler, encoding, expat, namespace_separator,
+                       process_namespaces, disable_entities, process_comments):
+    if not process_namespaces:
+        namespace_separator = None
+    parser = expat.ParserCreate(
+        encoding,
+        namespace_separator
+    )
+    parser.ordered_attributes = True
+    parser.StartNamespaceDeclHandler = handler.startNamespaceDecl
+    parser.StartElementHandler = handler.startElement
+    parser.EndElementHandler = handler.endElement
+    parser.CharacterDataHandler = handler.characters
+    if process_comments:
+        parser.CommentHandler = handler.comments
+    parser.buffer_text = True
+    if disable_entities:
+        def _forbid_entities(*_args, **_kwargs):
+            raise ValueError("entities are disabled")
+
+        parser.EntityDeclHandler = _forbid_entities
+    return parser
+
+
 def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
           namespace_separator=':', disable_entities=True, process_comments=False, **kwargs):
     """Parse the given XML input and convert it into a dictionary.
@@ -348,25 +372,9 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
     if isinstance(xml_input, str):
         encoding = encoding or 'utf-8'
         xml_input = xml_input.encode(encoding)
-    if not process_namespaces:
-        namespace_separator = None
-    parser = expat.ParserCreate(
-        encoding,
-        namespace_separator
-    )
-    parser.ordered_attributes = True
-    parser.StartNamespaceDeclHandler = handler.startNamespaceDecl
-    parser.StartElementHandler = handler.startElement
-    parser.EndElementHandler = handler.endElement
-    parser.CharacterDataHandler = handler.characters
-    if process_comments:
-        parser.CommentHandler = handler.comments
-    parser.buffer_text = True
-    if disable_entities:
-        def _forbid_entities(*_args, **_kwargs):
-            raise ValueError("entities are disabled")
-
-        parser.EntityDeclHandler = _forbid_entities
+    parser = _make_expat_parser(handler, encoding, expat, namespace_separator,
+                                process_namespaces, disable_entities,
+                                process_comments)
     if hasattr(xml_input, 'read'):
         parser.ParseFile(xml_input)
     elif isgenerator(xml_input):
@@ -376,6 +384,118 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
     else:
         parser.Parse(xml_input, True)
     return handler.item
+
+
+def _iter_xml_chunks(xml_input, encoding=None, chunk_size=8192):
+    """Yield byte chunks from the supported kinds of ``parse`` inputs.
+
+    Strings are encoded exactly once. File-like objects are consumed through
+    ``read`` in fixed-size chunks; every other iterable (typically a
+    one-shot generator of chunks) is consumed lazily. Neither is ever closed:
+    the caller owns the source and is responsible for its cleanup.
+    """
+    def _encode(chunk):
+        return chunk.encode(encoding or 'utf-8') if isinstance(chunk, str) else chunk
+
+    if isinstance(xml_input, (bytes, bytearray, memoryview)):
+        yield bytes(xml_input)
+    elif isinstance(xml_input, str):
+        yield _encode(xml_input)
+    elif hasattr(xml_input, 'read'):
+        while True:
+            chunk = xml_input.read(chunk_size)
+            if not chunk:
+                break
+            yield _encode(chunk)
+    elif hasattr(xml_input, '__iter__'):
+        for chunk in xml_input:
+            yield _encode(chunk)
+    else:
+        yield _encode(xml_input)
+
+
+def parse_items(xml_input, item_depth, encoding=None, expat=expat,
+                process_namespaces=False, namespace_separator=':',
+                disable_entities=True, process_comments=False,
+                chunk_size=8192, **kwargs):
+    """Pull-based counterpart of :func:`parse` in streaming mode.
+
+    Yields ``(path, item)`` tuples for every element at ``item_depth``, in
+    document order. ``path`` is the list of name-attributes pairs from the
+    document root to the item (so ancestor attributes are included), and
+    ``item`` is the same dict the push-mode ``item_callback`` would receive.
+    Item order, path contents, namespace handling and every other parsing
+    option behave exactly like ``parse(..., item_depth=...)``.
+
+    ``xml_input`` may be a string, a caller-owned file-like object, or a
+    one-shot iterable/generator of chunks. Parsing pauses as soon as the next
+    item is available: a chunk is read only while no item is pending, so an
+    unrequested item never triggers another read. ``chunk_size`` controls how
+    much is read at once from file-like objects. The source is never closed
+    here. On exhaustion the generator simply ends; on a malformed document
+    the underlying ``expat.ExpatError`` (or any parser exception) propagates
+    to the caller, but only after every item parsed before the error has been
+    yielded. In every case -- explicit ``close()``, end of input, or error --
+    the caller keeps ownership of the source and is responsible for closing
+    it.
+
+    Example::
+
+        >>> with open('big.xml', 'rb') as f:
+        ...     for path, item in xmltodict.parse_items(f, item_depth=2):
+        ...         process(item)
+    """
+    if item_depth < 1:
+        raise ValueError("item_depth must be at least 1; "
+                         "use parse() to get the whole document")
+    return _parse_items(xml_input, item_depth, encoding, expat,
+                        process_namespaces, namespace_separator,
+                        disable_entities, process_comments, chunk_size,
+                        **kwargs)
+
+
+def _parse_items(xml_input, item_depth, encoding, expat, process_namespaces,
+                 namespace_separator, disable_entities, process_comments,
+                 chunk_size, **kwargs):
+    queue = []
+
+    def item_callback(path, item):
+        queue.append((list(path), item))
+        return True
+
+    handler = _DictSAXHandler(item_depth=item_depth,
+                              item_callback=item_callback,
+                              namespace_separator=namespace_separator,
+                              **kwargs)
+    parser = _make_expat_parser(handler, encoding, expat, namespace_separator,
+                                process_namespaces, disable_entities,
+                                process_comments)
+    chunks = _iter_xml_chunks(xml_input, encoding, chunk_size)
+    pending_error = None
+    done = False
+    while True:
+        while not queue and not done:
+            if pending_error is not None:
+                raise pending_error
+            try:
+                chunk = next(chunks)
+            except StopIteration:
+                try:
+                    parser.Parse(b'', True)
+                except Exception as exc:
+                    pending_error = exc
+                done = True
+            else:
+                try:
+                    parser.Parse(chunk, False)
+                except Exception as exc:
+                    pending_error = exc
+                    done = True
+        if not queue:
+            if pending_error is not None:
+                raise pending_error
+            return
+        yield queue.pop(0)
 
 
 def _convert_value_to_string(value, encoding='utf-8', bytes_errors='replace'):
