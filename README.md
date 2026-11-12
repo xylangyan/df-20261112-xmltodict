@@ -217,6 +217,7 @@ Parse XML input into a Python dictionary.
 - `strip_whitespace=True`: Remove leading/trailing whitespace in text nodes. Default is True; this trims whitespace in text nodes. Set to False to preserve whitespace exactly. When `process_comments=True`, this same flag also trims comment text; disable `strip_whitespace` if you need to preserve comment indentation or padding. If you preserve whitespace text nodes, avoid combining this with `unparse(..., pretty=True)`: the preserved text nodes and pretty-print indentation/newlines will both be emitted.
 - `namespaces=None`: Mapping of namespaces to prefixes, or None to keep full URIs.
 - `force_list=None`: Force list values for specific elements. Can be a boolean (True/False), a tuple of element names to force lists for, or a callable function that receives (path, key, value) and returns True/False. Useful for elements that may appear once or multiple times to ensure consistent list output.
+- `force_list_paths=None`: Force list values by element location instead of tag name. An iterable of rules; each rule is an ancestor path (tuple/list of element names, or a single string) using the same names as the parsed dictionary (including namespace prefixes/URIs), optionally paired with a boolean as `(path, False)` to explicitly disable list forcing at that location. A rule covers the element at the path itself and the elements directly below it; longer, more specific rules override shorter ancestor rules. Rules not mentioning a location fall back to `force_list`. Works with `item_depth` streaming: the item's fields follow the same path semantics.
 - `item_depth=0`: Depth at which to call `item_callback`.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
 - `comment_key='#comment'`: Key used for XML comments when `process_comments=True`. Only used when `process_comments=True`. Comments can be preserved but multiple top-level comments may not retain order.
@@ -237,6 +238,7 @@ Convert a Python dictionary back into XML.
 - `indent='\t'`: Indentation string for pretty printing. May also be an integer number of spaces.
 - `newl='\n'`: Newline character for pretty printing.
 - `expand_iter=None`: Tag name to use for items in nested lists (breaks roundtripping).
+- `unparse_list_keys=None`: Write-back side of path-based list forcing. Accepts key-name strings (force those names to emit as lists) and/or the same path rules as `force_list_paths`. A `(path, False)` rule marks a single-valued location: a one-item list there is unwrapped and emitted as one element instead of an extra duplicate. Locations without a rule keep shape-driven emission.
 
 > **Note:** When building XML from dictionaries, keys whose values are empty
 > lists are skipped. For example, `{'a': []}` produces no `<a>` element. Add a
@@ -288,6 +290,44 @@ The `force_list` parameter can be used to selectively force list values for spec
 >>> xmltodict.parse(xml, force_list=should_force_list)
 {'a': {'b': ['data1', 'data2'], 'c': 'data3'}}
 ```
+
+### Path-based force_list (namespaces and override)
+
+A tag name can appear in several places or namespaces with different
+cardinality — for example a multi-valued record body `name` next to a
+single-valued metadata `name`. `force_list_paths` targets elements by their
+ancestor path and namespace-qualified name, so the two can be told apart. A
+rule covers the element at the path itself and its direct children; more
+specific rules inherit and override ancestor rules, and `(path, False)`
+explicitly disables list forcing at a location.
+
+```python
+>>> xml = '''<suppliers xmlns:rec="http://supplier/record"
+...                    xmlns:meta="http://supplier/meta">
+...   <records>
+...     <rec:record>
+...       <rec:name>alpha</rec:name>
+...       <rec:name>beta</rec:name>
+...       <meta:name>Acme Inc.</meta:name>
+...     </rec:record>
+...   </records>
+... </suppliers>'''
+>>> rules = [
+...     ('http://supplier/record:record',),                        # records and their fields
+...     (('http://supplier/record:record',
+...       'http://supplier/meta:name'), False),                    # ... except metadata name
+... ]
+>>> xmltodict.parse(xml, process_namespaces=True, force_list_paths=rules)
+{'suppliers': {'records': {'http://supplier/record:record': [
+    {'http://supplier/record:name': ['alpha', 'beta'],
+     'http://supplier/meta:name': 'Acme Inc.'}]}}}
+```
+
+The same path semantics apply inside streamed items when using `item_depth`;
+pass the identical rule list to `unparse(..., unparse_list_keys=rules)` on the
+write-back side. A `(path, False)` rule there unwraps an accidental one-item
+list so a single-valued field emits one element instead of a duplicate.
+
 
 ## Ok, how do I get it?
 

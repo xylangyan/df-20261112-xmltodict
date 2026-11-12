@@ -720,3 +720,128 @@ def test_force_list_true_applies_to_all_keys():
     xml = "<a><b>1</b><b>2</b><c>x</c></a>"
     expected = {"a": [{"b": ["1", "2"], "c": ["x"]}]}
     assert parse(xml, force_list=True) == expected
+
+
+_NS_REC = 'http://supplier/record'
+_NS_META = 'http://supplier/meta'
+
+
+def _supplier_xml(record_names):
+    """Supplier feed where two namespaces both use a `name` element.
+
+    `record_names` is a list of per-record lists of record-body names; every
+    record also carries exactly one metadata name.
+    """
+    records = ''.join(
+        '<rec:record>{names}<meta:name>meta-{i}</meta:name></rec:record>'.format(
+            names=''.join(f'<rec:name>{n}</rec:name>' for n in names), i=i)
+        for i, names in enumerate(record_names))
+    return (
+        f'<suppliers xmlns:rec="{_NS_REC}" xmlns:meta="{_NS_META}">'
+        f'<records>{records}</records></suppliers>')
+
+
+_SUPPLIER_LIST_RULES = [
+    (_NS_REC + ':record',),
+    ((_NS_REC + ':record', _NS_META + ':name'), False),
+]
+
+
+def _supplier_records(record_names):
+    return [
+        {
+            _NS_REC + ':name': list(names),
+            _NS_META + ':name': f'meta-{i}',
+        }
+        for i, names in enumerate(record_names)
+    ]
+
+
+def test_force_list_paths_distinguishes_namespaces():
+    # Both namespaces use a `name` element: the record body one is
+    # multi-valued, the metadata one never is. A tag-name rule cannot tell
+    # them apart; path rules can.
+    for record_names in ([['alpha']], [['alpha', 'beta']],
+                         [['alpha'], ['beta']], [['alpha', 'beta'], ['gamma']]):
+        result = parse(_supplier_xml(record_names),
+                       process_namespaces=True,
+                       force_list_paths=_SUPPLIER_LIST_RULES)
+        records = result['suppliers']['records'][_NS_REC + ':record']
+        assert isinstance(records, list)
+        assert records == _supplier_records(record_names)
+        for record in records:
+            assert isinstance(record[_NS_REC + ':name'], list)
+            assert isinstance(record[_NS_META + ':name'], str)
+
+
+def test_force_list_paths_leaf_rule_only_affects_that_position():
+    xml = _supplier_xml([['alpha']])
+    result = parse(
+        xml, process_namespaces=True,
+        force_list_paths=[(_NS_REC + ':record', _NS_REC + ':name')])
+    record = result['suppliers']['records'][_NS_REC + ':record']
+    assert record[_NS_REC + ':name'] == ['alpha']
+    assert record[_NS_META + ':name'] == 'meta-0'
+
+
+def test_force_list_paths_accepts_single_string_rule():
+    xml = '<servers><server><name>host1</name></server></servers>'
+    result = parse(xml, force_list_paths='server')
+    # An ancestor rule also covers the fields directly below it.
+    assert result == {'servers': {'server': [{'name': ['host1']}]}}
+
+
+def test_force_list_paths_specific_rule_overrides_ancestor_rule():
+    xml = '<root><group><item>1</item><keep>2</keep></group></root>'
+    rules = [('group',), (('group', 'keep'), False)]
+    result = parse(xml, force_list_paths=rules)
+    assert result == {'root': {'group': [{'item': ['1'], 'keep': '2'}]}}
+
+
+def test_force_list_paths_do_not_override_unlisted_positions():
+    # Locations not mentioned by a rule keep the legacy force_list behavior.
+    xml = ('<root xmlns:rec="http://supplier/record" '
+           'xmlns:meta="http://supplier/meta">'
+           '<rec:name>body</rec:name><meta:name>meta</meta:name></root>')
+    result = parse(xml, process_namespaces=True,
+                   force_list=('http://supplier/record:name',),
+                   force_list_paths=[('http://supplier/meta:name',)])
+    assert result['root']['http://supplier/record:name'] == ['body']
+    assert result['root']['http://supplier/meta:name'] == ['meta']
+
+
+def test_force_list_paths_streaming_item_shape():
+    seen = []
+
+    def callback(path, item):
+        seen.append(([name for name, _ in path], item))
+        return True
+
+    parse(_supplier_xml([['alpha'], ['beta', 'gamma']]),
+          process_namespaces=True, force_list_paths=_SUPPLIER_LIST_RULES,
+          item_depth=3, item_callback=callback)
+
+    # Streamed items show the same path semantics as the full parse: every
+    # record body name is a list, each metadata name stays a scalar.
+    assert len(seen) == 2
+    assert seen[0][0] == ['suppliers', 'records', _NS_REC + ':record']
+    assert seen[0][1][_NS_REC + ':name'] == ['alpha']
+    assert seen[0][1][_NS_META + ':name'] == 'meta-0'
+    assert seen[1][1][_NS_REC + ':name'] == ['beta', 'gamma']
+    assert seen[1][1][_NS_META + ':name'] == 'meta-1'
+
+
+def test_force_list_paths_streaming_item_depth_truncation():
+    # With the records element as the streaming item its path is truncated to
+    # the supplied prefix, yet the child fields inside the item must follow
+    # the same path rules.
+    seen = []
+    parse('<root><records><record><name>a</name><name>b</name></record>'
+          '<record><name>c</name></record></records></root>',
+          item_depth=2,
+          force_list_paths=[('records', 'record', 'name')],
+          item_callback=lambda path, item: seen.append((list(path), item)) or True)
+    assert len(seen) == 1
+    path, item = seen[0]
+    assert [name for name, _ in path] == ['root', 'records']
+    assert item == {'record': [{'name': ['a', 'b']}, {'name': ['c']}]}

@@ -778,3 +778,65 @@ def test_pretty_print_top_level_comment_with_int_indent():
     <!--top-->
     <a>1</a>''')
     assert xml == unparse(obj, pretty=True, indent=4)
+
+
+_NS_REC = 'http://supplier/record'
+_NS_META = 'http://supplier/meta'
+_NS_MAP = {_NS_REC: 'rec', _NS_META: 'meta'}
+_SUPPLIER_LIST_RULES = [
+    (_NS_REC + ':record',),
+    ((_NS_REC + ':record', _NS_META + ':name'), False),
+]
+
+
+def _supplier_obj(record_names, wrap_meta_name=False):
+    records = []
+    for i, names in enumerate(record_names):
+        meta_name = ['meta-%d' % i] if wrap_meta_name else 'meta-%d' % i
+        records.append({_NS_REC + ':name': list(names),
+                        _NS_META + ':name': meta_name})
+    return {'suppliers': {'records': {_NS_REC + ':record': records}}}
+
+
+def test_unparse_list_keys_supplier_element_counts():
+    # One record and two records: the single-valued metadata name must not
+    # gain an extra element even when it arrives wrapped in a one-item list.
+    for record_names in ([['alpha']], [['alpha', 'beta'], ['gamma']]):
+        obj = _supplier_obj(record_names, wrap_meta_name=True)
+        xml = unparse(obj, namespaces=_NS_MAP,
+                      unparse_list_keys=_SUPPLIER_LIST_RULES)
+        expected_names = sum(len(names) for names in record_names)
+        assert xml.count('<rec:name>') == expected_names
+        assert xml.count('<meta:name>') == len(record_names)
+        assert xml.count('<rec:record>') == len(record_names)
+
+
+def test_unparse_list_keys_wraps_scalar_at_list_position():
+    obj = {'a': {'b': 'x'}}
+    xml = unparse(obj, unparse_list_keys=[('a', 'b', True)])
+    assert xml.count('<b>') == 1
+    # A list position keeps every entry.
+    obj = {'a': {'b': ['x', 'y']}}
+    xml = unparse(obj, unparse_list_keys=[('a', 'b', True)])
+    assert xml.count('<b>') == 2
+
+
+def test_unparse_list_keys_plain_names():
+    obj = {'a': {'b': 'x', 'c': {'b': 'y'}}}
+    xml = unparse(obj, unparse_list_keys=['b'])
+    assert xml.count('<b>') == 2
+
+
+def test_unparse_list_keys_absent_keeps_shape_driven_behavior():
+    obj = {'a': {'b': ['x', 'y'], 'c': 'z'}}
+    xml = unparse(obj)
+    assert xml.count('<b>') == 2
+    assert xml.count('<c>') == 1
+
+
+def test_unparse_list_keys_leave_unlisted_locations_untouched():
+    obj = {'a': {'b': ['x', 'y'], 'c': ['z']}}
+    xml = unparse(obj, unparse_list_keys=[('a', 'b', True)])
+    assert xml.count('<b>') == 2
+    # 'c' has no rule: its one-item list must not be unwrapped or repeated.
+    assert xml.count('<c>') == 1

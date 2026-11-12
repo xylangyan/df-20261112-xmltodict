@@ -12,6 +12,77 @@ class ParsingInterrupted(Exception):
     pass
 
 
+def _coerce_path(path):
+    """Normalize a user-supplied path into a tuple of element-name strings.
+
+    Accepts any iterable of strings or ``(name, attrs)`` pairs, mirroring the
+    ``path`` tuples handed to ``item_callback``/``postprocessor``.
+    """
+    if isinstance(path, str):
+        return (path,)
+    return tuple(entry[0] if isinstance(entry, (tuple, list)) else entry
+                 for entry in path)
+
+
+def _resolve_path_rules(rules):
+    """Turn path-based force_list rules into ``(mode, path_tuple)`` entries.
+
+    Each rule is either an ancestor path (tuple/list/string of element names)
+    whose matching elements are forced into lists, or a ``(path, enabled)``
+    pair that explicitly enables (``True``) or disables (``False``) list
+    forcing. More specific (longer) rules take precedence, so a disabling
+    rule overrides an enabling rule inherited from a shorter ancestor path.
+    """
+    resolved = []
+    if isinstance(rules, str):
+        rules = (rules,)
+    for rule in rules:
+        if isinstance(rule, tuple) and len(rule) == 2 \
+                and isinstance(rule[1], bool):
+            path, enabled = rule
+        else:
+            path, enabled = rule, True
+        resolved.append((bool(enabled), _coerce_path(path)))
+    # Longest paths first so the most specific rule wins.
+    resolved.sort(key=lambda entry: len(entry[1]), reverse=True)
+    return resolved
+
+
+def _path_rule_matches(rule_path, element_path):
+    """Match a rule path against an element path.
+
+    A rule matches the element at the rule path itself (matched as a suffix,
+    so the document root does not have to be repeated) and every element
+    sitting directly below that ancestor. This lets one rule such as
+    ``('...', 'record')`` cover both the repeated ``record`` element and its
+    child fields, including the truncated item itself in streaming mode.
+    """
+    rule_len = len(rule_path)
+    if rule_len == 0:
+        return True
+    if rule_len > len(element_path):
+        return False
+    if element_path[-rule_len:] == rule_path:
+        return True
+    # Ancestor rule applies to its immediate children (and to the truncated
+    # streaming item, which is exactly one level below it). Match the parent
+    # chain as a suffix too, so an omitted document root still works.
+    return (len(element_path) > rule_len
+            and element_path[-rule_len - 1:-1] == rule_path)
+
+
+def _matches_path_rules(path_rules, element_path):
+    """Apply resolved path rules; most specific (longest) match wins.
+
+    Returns ``None`` when no rule matches, otherwise the enabling flag of the
+    winning rule.
+    """
+    for enabled, rule_path in path_rules:
+        if _path_rule_matches(rule_path, element_path):
+            return enabled
+    return None
+
+
 class _DictSAXHandler:
     def __init__(
         self,
@@ -28,6 +99,7 @@ class _DictSAXHandler:
         namespace_separator=":",
         namespaces=None,
         force_list=None,
+        force_list_paths=None,
         comment_key="#comment",
     ):
         self.path = []
@@ -48,6 +120,10 @@ class _DictSAXHandler:
         self.namespaces = namespaces
         self.namespace_declarations = dict_constructor()
         self.force_list = force_list
+        self.force_list_paths = (
+            _resolve_path_rules(force_list_paths)
+            if force_list_paths else None
+        )
         self.comment_key = comment_key
 
     def _build_name(self, full_name):
@@ -185,6 +261,11 @@ class _DictSAXHandler:
         return item
 
     def _should_force_list(self, key, value):
+        if self.force_list_paths is not None:
+            element_path = _coerce_path(self.path)
+            verdict = _matches_path_rules(self.force_list_paths, element_path)
+            if verdict is not None:
+                return verdict
         if not self.force_list:
             return False
         if isinstance(self.force_list, bool):
@@ -206,7 +287,8 @@ class _DictSAXHandler:
 
 
 def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
-          namespace_separator=':', disable_entities=True, process_comments=False, **kwargs):
+          namespace_separator=':', disable_entities=True, process_comments=False,
+          force_list_paths=None, **kwargs):
     """Parse the given XML input and convert it into a dictionary.
 
     `xml_input` can either be a `string`, a file-like object, or a generator of strings.
@@ -309,6 +391,31 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         `value`. This is helpful in cases where the logic that decides whether
         a list should be forced is more complex.
 
+        `force_list_paths` targets elements by their location instead of just
+        their tag name. It is an iterable of rules, where each rule is an
+        ancestor path (a tuple/list of element names, or a single string)
+        expressed with the same name semantics as the parsed dictionary:
+        namespace-prefixed names such as `'http://a.com/:name'` or
+        `'ns_a:name'` are matched exactly, so two elements sharing the local
+        name `name` in different namespaces can be told apart. A rule matches
+        any element whose path ends with that path (the full document root
+        does not have to be repeated) or that sits directly below a named
+        ancestor path. Longer, more specific rules inherit and override
+        shorter ones; a `(path, False)` pair explicitly disables list forcing
+        at that location, overriding an enabling ancestor rule. When streaming
+        with `item_depth`, the element path seen here is the same truncated
+        path that `item_callback` receives. Rules are consulted first;
+        locations they do not mention still fall back to `force_list`.
+
+        For example, given a document where `rec:name` repeats inside records
+        but the metadata `meta:name` is always single-valued::
+
+            force_list_paths=[
+                ('http://supplier/record:record',),      # records and their fields
+                (('http://supplier/record:record',
+                  'http://supplier/meta:name'), False),  # ... except metadata name
+            ]
+
 
         If `process_comments` is `True`, comments will be added using `comment_key`
         (default=`'#comment'`) to the tag that contains the comment.
@@ -344,6 +451,7 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         indentation or padding intact.
     """
     handler = _DictSAXHandler(namespace_separator=namespace_separator,
+                              force_list_paths=force_list_paths,
                               **kwargs)
     if isinstance(xml_input, str):
         encoding = encoding or 'utf-8'
@@ -430,6 +538,29 @@ def _validate_comment(value):
     return value
 
 
+def _should_unparse_as_list(unparse_list_keys, path, key, value):
+    """Decide whether a dict value must be emitted as repeated child elements.
+
+    Path-based rules are resolved first (deepest match wins, with explicit
+    disabling overriding an inherited enabling rule). Otherwise the legacy
+    set of key names applies. Returns ``None`` when no rule mentions the
+    location, leaving the natural shape of `value` untouched.
+    """
+    if unparse_list_keys is None:
+        return None
+    element_path = tuple(_coerce_path(path + (key,)))
+    rules, plain_keys = unparse_list_keys
+    if rules is not None:
+        verdict = _matches_path_rules(rules, element_path)
+        if verdict is not None:
+            return verdict
+    if plain_keys is not None and key in plain_keys:
+        return True
+    # No rule mentions this location: leave the natural shape of the value
+    # alone instead of implicitly treating it as a non-list.
+    return None
+
+
 def _process_namespace(name, namespaces, ns_sep=':', attr_prefix='@'):
     if not isinstance(name, str):
         return name
@@ -461,7 +592,9 @@ def _emit(key, value, content_handler,
           expand_iter=None,
           encoding='utf-8',
           bytes_errors='replace',
-          comment_key='#comment'):
+          comment_key='#comment',
+          unparse_list_keys=None,
+          path=()):
     if isinstance(key, str) and key == comment_key:
         comments_list = value if isinstance(value, list) else [value]
         if isinstance(indent, int):
@@ -481,6 +614,7 @@ def _emit(key, value, content_handler,
                 content_handler.ignorableWhitespace(newl)
         return
 
+    path_key = key
     key = _process_namespace(key, namespaces, namespace_separator, attr_prefix)
     if preprocessor is not None:
         result = preprocessor(key, value)
@@ -489,6 +623,14 @@ def _emit(key, value, content_handler,
         key, value = result
     # Minimal validation to avoid breaking out of tag context
     _validate_name(key, "element")
+    # Path rules use the dictionary's own key names, matching the same
+    # namespace semantics as parse (full URIs when no mapping is supplied).
+    list_verdict = _should_unparse_as_list(
+        unparse_list_keys, path, path_key, value)
+    if list_verdict is True and not isinstance(value, list):
+        value = [value]
+    elif list_verdict is False and isinstance(value, list) and len(value) == 1:
+        value = value[0]
     if not hasattr(value, '__iter__') or isinstance(value, (str, bytes, bytearray, memoryview, dict)):
         value = [value]
     for index, v in enumerate(value):
@@ -548,7 +690,9 @@ def _emit(key, value, content_handler,
                   pretty, newl, indent, namespaces=namespaces,
                   namespace_separator=namespace_separator,
                   expand_iter=expand_iter, encoding=encoding,
-                  bytes_errors=bytes_errors, comment_key=comment_key)
+                  bytes_errors=bytes_errors, comment_key=comment_key,
+                  unparse_list_keys=unparse_list_keys,
+                  path=path + (key,))
         if cdata is not None:
             content_handler.characters(cdata)
         if pretty and children:
@@ -566,7 +710,7 @@ class _XMLGenerator(XMLGenerator):
 
 def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
             short_empty_elements=False, comment_key='#comment',
-            **kwargs):
+            unparse_list_keys=None, **kwargs):
     """Emit an XML document for the given `input_dict` (reverse of `parse`).
 
     The resulting XML document is returned as a string, but if `output` (a
@@ -586,12 +730,37 @@ def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
     The `bytes_errors` parameter controls decoding errors for byte values and
     defaults to `'replace'`.
 
+    `unparse_list_keys` is the write-back side of path-aware list forcing. It
+    accepts an iterable of key-name strings (like `parse`'s `force_list`
+    tuple) and/or the same path rules described for `force_list_paths`.
+    Matching locations are always emitted as repeated elements, so a single
+    dict is wrapped as one element. A ``(path, False)`` rule marks a location
+    that is never a list: a one-item list there is unwrapped and emitted as a
+    plain element, which avoids accidentally adding a duplicate element for a
+    single-valued field. Without this option `unparse` keeps its previous
+    shape-driven behavior.
+
     """
     bytes_errors = kwargs.pop('bytes_errors', 'replace')
     try:
         codecs.lookup_error(bytes_errors)
     except LookupError as exc:
         raise ValueError(f"Invalid bytes_errors handler: {bytes_errors}") from exc
+
+    if unparse_list_keys is not None:
+        if isinstance(unparse_list_keys, str):
+            unparse_list_keys = (unparse_list_keys,)
+        plain_keys = set()
+        path_rules = []
+        for entry in unparse_list_keys:
+            if isinstance(entry, str):
+                plain_keys.add(entry)
+            else:
+                path_rules.append(entry)
+        unparse_list_keys = (
+            _resolve_path_rules(path_rules) if path_rules else None,
+            plain_keys or None,
+        )
 
     must_return = False
     if output is None:
@@ -615,6 +784,7 @@ def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
             encoding=encoding,
             bytes_errors=bytes_errors,
             comment_key=comment_key,
+            unparse_list_keys=unparse_list_keys,
             **kwargs,
         )
         if key != comment_key:
