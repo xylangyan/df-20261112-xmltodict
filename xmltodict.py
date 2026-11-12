@@ -7,9 +7,82 @@ from xml.sax.xmlreader import AttributesImpl
 from io import StringIO
 from inspect import isgenerator
 import codecs
+import re
 
 class ParsingInterrupted(Exception):
     pass
+
+
+class SourceLocation(dict):
+    """A mapping of source-position keys that also supports attribute access."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
+class XMLParseError(Exception):
+    """Base class for XML parsing errors that carry source context."""
+
+    def __init__(self, message, context):
+        super().__init__(message)
+        self.context = SourceLocation(context)
+        self.location = self.context
+        self.record_index = self.context.get("record_index")
+        self.item_index = self.record_index
+        self.element_path = self.context.get("element_path")
+        self.path = self.element_path
+        self.field_name = self.context.get("field_name")
+        self.line = self.context.get("line")
+        self.line_number = self.line
+        self.column = self.context.get("column")
+        self.column_number = self.column
+        self.byte_index = self.context.get("byte_index")
+        self.byte_offset = self.byte_index
+        self.position = self.byte_index
+        self.position_kind = self.context.get("position_kind")
+        self.target = self.position_kind
+
+    def __str__(self):
+        details = [super().__str__()]
+        if self.record_index is not None:
+            details.append(f"record_index={self.record_index}")
+        if self.element_path is not None:
+            details.append(f"element_path={self.element_path}")
+        if self.field_name is not None:
+            details.append(f"field_name={self.field_name}")
+        if self.line is not None:
+            details.append(f"line={self.line}")
+        if self.column is not None:
+            details.append(f"column={self.column}")
+        if self.byte_index is not None:
+            details.append(f"byte_index={self.byte_index}")
+        if self.position_kind is not None:
+            details.append(f"position_kind={self.position_kind}")
+        if len(details) > 1:
+            return f"{details[0]} ({', '.join(details[1:])})"
+        return details[0]
+
+
+class XMLPostprocessorError(XMLParseError, ValueError):
+    """A postprocessor failed while processing an XML value or attribute.
+
+    It also inherits from ``ValueError`` so existing handlers that catch the
+    postprocessor's original exception type keep working.
+    """
+
+
+class XMLSyntaxError(XMLParseError, expat.ExpatError):
+    """The XML parser rejected malformed source XML."""
+
+
+# Common alternative spellings kept as aliases for callers that prefer the
+# shorter names.
+XMLParsingError = XMLParseError
+PostprocessorError = XMLPostprocessorError
+XMLParserError = XMLSyntaxError
 
 
 class _DictSAXHandler:
@@ -29,11 +102,19 @@ class _DictSAXHandler:
         namespaces=None,
         force_list=None,
         comment_key="#comment",
+        track_locations=False,
     ):
         self.path = []
         self.stack = []
         self.data = []
         self.item = None
+        self.track_locations = track_locations
+        self._parser = None
+        self._source_prefix = None
+        self._data_locations = []
+        self._element_locations = []
+        self._record_index = 0
+        self._last_event_was_characters = False
         self.item_depth = item_depth
         self.xml_attribs = xml_attribs
         self.item_callback = item_callback
@@ -71,26 +152,131 @@ class _DictSAXHandler:
             return attrs
         return self.dict_constructor(zip(attrs[0::2], attrs[1::2]))
 
+    def _current_location(self):
+        if self._parser is None:
+            return None
+        index = self._parser.CurrentByteIndex
+        return (
+            self._parser.CurrentLineNumber,
+            self._parser.CurrentColumnNumber + 1,
+            self._source_byte_index(index),
+        )
+
+    def _source_byte_index(self, parser_index):
+        if not self._source_prefix:
+            return parser_index
+        if 0 <= parser_index <= len(self._source_prefix):
+            return parser_index
+        # Start tags split across input chunks can reset expat's byte index to
+        # the start of the buffered token. The input context is the source
+        # prefix in that case, and raw byte positions are exact.
+        context = self._parser.GetInputContext()
+        if not context:
+            return parser_index
+        window_start = self._source_prefix.rfind(context)
+        if window_start < 0:
+            return parser_index
+        return window_start + parser_index
+
+    def _element_path(self):
+        return tuple(name for name, _attrs in self.path)
+
+    def _context(self, key=None, location=None, position_kind=None):
+        context = {
+            "record_index": self._record_index or None,
+            "element_path": self._element_path(),
+        }
+        if key is not None:
+            context["field_name"] = key
+        if location is not None:
+            context["line"], context["column"], context["byte_index"] = location
+        if position_kind is not None:
+            context["position_kind"] = position_kind
+        return context
+
+    def _attribute_location(self, name, element_location):
+        if self._parser is None or element_location is None:
+            return None
+        context = self._parser.GetInputContext()
+        if not context:
+            return None
+        names = [name]
+        if self.namespaces is not None and ":" in name:
+            names.append(name.rsplit(":", 1)[-1])
+        match = None
+        for candidate_name in names:
+            pattern = re.compile(
+                rb"(?:\s|^)" + re.escape(candidate_name.encode("utf-8"))
+                + rb"\s*=\s*(['\"])"
+            )
+            for candidate in pattern.finditer(context):
+                prefix = context[:candidate.start()]
+                if prefix.count(b'"') % 2 == 0 and prefix.count(b"'") % 2 == 0:
+                    match = candidate
+                    break
+            if match is not None:
+                break
+        if match is None:
+            return None
+        value_index = match.end()
+        tag_index = context.find(b"<")
+        if tag_index < 0:
+            tag_index = 0
+        try:
+            prefix = context[tag_index:value_index].decode("utf-8")
+        except UnicodeDecodeError:
+            prefix = context[tag_index:value_index]
+        line_start = max(prefix.rfind("\n"), prefix.rfind("\r"))
+        line = element_location[0] + prefix.count("\n")
+        if line_start < 0:
+            column = element_location[1] + len(prefix)
+        else:
+            column = len(prefix) - line_start
+        byte_index = element_location[2] - tag_index + value_index
+        return (line, column, byte_index)
+
+    def _raise_postprocessor_error(self, exc, key, location, position_kind):
+        context = self._context(key, location, position_kind)
+        message = (
+            f"postprocessor failed for field {key!r} "
+            f"at element path {'/'.join(context['element_path'])!r}"
+        )
+        raise XMLPostprocessorError(message, context) from exc
+
     def startNamespaceDecl(self, prefix, uri):
         self.namespace_declarations[prefix or ''] = uri
 
     def startElement(self, full_name, attrs):
         name = self._build_name(full_name)
         attrs = self._attrs_to_dict(attrs)
+        element_location = self._current_location()
         if self.namespace_declarations:
             if not attrs:
                 attrs = self.dict_constructor()
             attrs['xmlns'] = self.namespace_declarations
             self.namespace_declarations = self.dict_constructor()
         self.path.append((name, attrs or None))
+        self._element_locations.append(element_location)
+        self._data_locations.append(None)
+        if len(self.path) == self.item_depth and self.item_depth:
+            self._record_index += 1
+        self._last_event_was_characters = False
         if len(self.path) >= self.item_depth:
             self.stack.append((self.item, self.data))
             if self.xml_attribs:
                 attr_entries = []
-                for key, value in attrs.items():
-                    key = self.attr_prefix+self._build_name(key)
+                for raw_key, value in attrs.items():
+                    key = self.attr_prefix+self._build_name(raw_key)
                     if self.postprocessor:
-                        entry = self.postprocessor(self.path, key, value)
+                        attribute_location = self._attribute_location(
+                            raw_key, element_location or (None, None, None))
+                        try:
+                            entry = self.postprocessor(self.path, key, value)
+                        except Exception as exc:
+                            if self.track_locations:
+                                self._raise_postprocessor_error(
+                                    exc, key, attribute_location, "attribute_value")
+                            raise
                     else:
                         entry = (key, value)
                     if entry:
@@ -103,12 +289,15 @@ class _DictSAXHandler:
 
     def endElement(self, full_name):
         name = self._build_name(full_name)
+        element_location = self._element_locations.pop()
+        self._last_event_was_characters = False
         # If we just closed an item at the streaming depth, emit it and drop it
         # without attaching it back to its parent. This avoids accumulating all
         # streamed items in memory when using item_depth > 0.
         if len(self.path) == self.item_depth:
             data = (None if not self.data
                     else self.cdata_separator.join(self.data))
+            data_location = self._data_locations[-1]
             item = self.item
             if self.strip_whitespace and data:
                 data = data.strip() or None
@@ -116,7 +305,8 @@ class _DictSAXHandler:
                 item = self.dict_constructor()
             if item is not None:
                 if data:
-                    self.push_data(item, self.cdata_key, data)
+                    self.push_data(item, self.cdata_key, data, data_location,
+                                   "value")
             else:
                 item = data
 
@@ -127,45 +317,67 @@ class _DictSAXHandler:
             # the emitted item.
             if self.stack:
                 self.item, self.data = self.stack.pop()
+                self._data_locations.pop()
             else:
                 self.item = None
                 self.data = []
+                self._data_locations = []
             self.path.pop()
             return
         if self.stack:
             data = (None if not self.data
                     else self.cdata_separator.join(self.data))
+            data_location = self._data_locations[-1]
             item = self.item
             self.item, self.data = self.stack.pop()
+            self._data_locations.pop()
             if self.strip_whitespace and data:
                 data = data.strip() or None
             if data and self._should_force_cdata(name, data) and item is None:
                 item = self.dict_constructor()
             if item is not None:
                 if data:
-                    self.push_data(item, self.cdata_key, data)
-                self.item = self.push_data(self.item, name, item)
+                    self.push_data(item, self.cdata_key, data, data_location,
+                                   "value")
+                self.item = self.push_data(self.item, name, item,
+                                           element_location, "start_tag")
             else:
-                self.item = self.push_data(self.item, name, data)
+                self.item = self.push_data(self.item, name, data,
+                                           data_location, "value")
         else:
             self.item = None
             self.data = []
+            self._data_locations = []
         self.path.pop()
 
     def characters(self, data):
+        location = self._current_location()
         if not self.data:
             self.data = [data]
+            self._data_locations[-1] = location
+        elif self._last_event_was_characters:
+            self.data[-1] += data
         else:
             self.data.append(data)
+            self._data_locations[-1] = location
+        self._last_event_was_characters = True
 
     def comments(self, data):
+        self._last_event_was_characters = False
         if self.strip_whitespace:
             data = data.strip()
-        self.item = self.push_data(self.item, self.comment_key, data)
+        self.item = self.push_data(self.item, self.comment_key, data,
+                                   self._current_location(), "value")
 
-    def push_data(self, item, key, data):
+    def push_data(self, item, key, data, location=None, position_kind=None):
         if self.postprocessor is not None:
-            result = self.postprocessor(self.path, key, data)
+            try:
+                result = self.postprocessor(self.path, key, data)
+            except Exception as exc:
+                if self.track_locations:
+                    self._raise_postprocessor_error(
+                        exc, key, location, position_kind)
+                raise
             if result is None:
                 return item
             key, data = result
@@ -206,7 +418,9 @@ class _DictSAXHandler:
 
 
 def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
-          namespace_separator=':', disable_entities=True, process_comments=False, **kwargs):
+          namespace_separator=':', disable_entities=True, process_comments=False,
+          error_context=False, source_context=None, include_error_context=None,
+          **kwargs):
     """Parse the given XML input and convert it into a dictionary.
 
     `xml_input` can either be a `string`, a file-like object, or a generator of strings.
@@ -265,6 +479,13 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         >>> xmltodict.parse('<a><b>1</b><b>2</b><b>x</b></a>',
         ...                 postprocessor=postprocessor)
         {'a': {'b:int': [1, 2], 'b': 'x'}}
+
+    Set `error_context=True` to wrap postprocessor failures in
+    :class:`XMLPostprocessorError` and malformed XML in
+    :class:`XMLSyntaxError`. The `context` attribute contains the one-based
+    record number for streaming items, the element path, field name,
+    one-based line and column, source byte offset, and whether the position
+    identifies an element start tag, value, or the parser error location.
 
     You can pass an alternate version of `expat` (such as `defusedexpat`) by
     using the `expat` parameter. E.g:
@@ -343,7 +564,13 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         whitespace removed. Disable `strip_whitespace` to keep comment
         indentation or padding intact.
     """
+    track_locations = bool(error_context)
+    if source_context is not None:
+        track_locations = bool(source_context)
+    if include_error_context is not None:
+        track_locations = bool(include_error_context)
     handler = _DictSAXHandler(namespace_separator=namespace_separator,
+                              track_locations=track_locations,
                               **kwargs)
     if isinstance(xml_input, str):
         encoding = encoding or 'utf-8'
@@ -354,6 +581,10 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         encoding,
         namespace_separator
     )
+    handler._parser = parser
+    if handler.track_locations:
+        if isinstance(xml_input, (bytes, bytearray, memoryview)):
+            handler._source_prefix = bytearray(xml_input)
     parser.ordered_attributes = True
     parser.StartNamespaceDeclHandler = handler.startNamespaceDecl
     parser.StartElementHandler = handler.startElement
@@ -361,20 +592,49 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
     parser.CharacterDataHandler = handler.characters
     if process_comments:
         parser.CommentHandler = handler.comments
-    parser.buffer_text = True
+    # Buffered text does not expose the position where character data starts.
+    # Disable it only for location tracking; character events are coalesced in
+    # the handler so the parsed result stays the same.
+    parser.buffer_text = not handler.track_locations
     if disable_entities:
         def _forbid_entities(*_args, **_kwargs):
             raise ValueError("entities are disabled")
 
         parser.EntityDeclHandler = _forbid_entities
+
+    def _parse_with_context(parse):
+        if not handler.track_locations:
+            return parse()
+        try:
+            return parse()
+        except expat.ExpatError as exc:
+            location = handler._current_location()
+            context = handler._context(
+                location=location, position_kind="parser_error")
+            wrapped = XMLSyntaxError(str(exc), context)
+            wrapped.__cause__ = exc
+            for attr in ("code", "lineno", "offset"):
+                try:
+                    setattr(wrapped, attr, getattr(exc, attr))
+                except AttributeError:
+                    pass
+            raise wrapped from exc
+
     if hasattr(xml_input, 'read'):
-        parser.ParseFile(xml_input)
+        _parse_with_context(lambda: parser.ParseFile(xml_input))
     elif isgenerator(xml_input):
-        for chunk in xml_input:
-            parser.Parse(chunk, False)
-        parser.Parse(b'', True)
+        def _parse_chunks():
+            for chunk in xml_input:
+                if handler.track_locations and isinstance(chunk, str):
+                    if handler._source_prefix is None:
+                        handler._source_prefix = bytearray()
+                    handler._source_prefix += chunk.encode("utf-8")
+                parser.Parse(chunk, False)
+            parser.Parse(b'', True)
+
+        _parse_with_context(_parse_chunks)
     else:
-        parser.Parse(xml_input, True)
+        _parse_with_context(lambda: parser.Parse(xml_input, True))
     return handler.item
 
 

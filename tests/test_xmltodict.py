@@ -1,4 +1,9 @@
-from xmltodict import parse, ParsingInterrupted
+from xmltodict import (
+    ParsingInterrupted,
+    XMLPostprocessorError,
+    XMLSyntaxError,
+    parse,
+)
 import collections
 import pytest
 from io import BytesIO
@@ -720,3 +725,217 @@ def test_force_list_true_applies_to_all_keys():
     xml = "<a><b>1</b><b>2</b><c>x</c></a>"
     expected = {"a": [{"b": ["1", "2"], "c": ["x"]}]}
     assert parse(xml, force_list=True) == expected
+
+
+CONTEXT_XML = (
+    "<records>\n"
+    "  <record><value>10</value><value>11</value></record>\n"
+    "  <record><value>20</value><value>21</value></record>\n"
+    "  <record><value>30</value><value>坏</value></record>\n"
+    "</records>"
+)
+
+
+def _context_chunks(size):
+    data = CONTEXT_XML.encode("utf-8")
+    for start in range(0, len(data), size):
+        yield data[start:start + size]
+
+
+def _context_str_chunks(size):
+    for start in range(0, len(CONTEXT_XML), size):
+        yield CONTEXT_XML[start:start + size]
+
+
+def _int_postprocessor(path, key, value):
+    if key == "value":
+        return key, int(value)
+    return key, value
+
+
+def test_postprocessor_error_context_whole_input():
+    delivered = []
+
+    def callback(path, item):
+        delivered.append(item)
+        return True
+
+    with pytest.raises(XMLPostprocessorError) as exc_info:
+        parse(CONTEXT_XML, item_depth=2, item_callback=callback,
+              postprocessor=_int_postprocessor, error_context=True)
+
+    error = exc_info.value
+    assert isinstance(error.__cause__, ValueError)
+    assert error.context == {
+        "record_index": 3,
+        "element_path": ("records", "record", "value"),
+        "field_name": "value",
+        "line": 4,
+        "column": 35,
+        "byte_index": 152,
+        "position_kind": "value",
+    }
+    # The first two records were delivered before the third failed.
+    assert delivered == [
+        {"value": [10, 11]},
+        {"value": [20, 21]},
+    ]
+
+    # The same position can be checked directly against the source bytes.
+    source = CONTEXT_XML.encode("utf-8")
+    assert source[error.byte_index:].startswith("坏".encode("utf-8"))
+
+
+def test_postprocessor_error_context_chunked_input():
+    for chunker in (_context_chunks, _context_str_chunks):
+        for chunk_size in (7, 13):
+            delivered = []
+
+            def callback(path, item):
+                delivered.append(item)
+                return True
+
+            with pytest.raises(XMLPostprocessorError) as exc_info:
+                parse(chunker(chunk_size), item_depth=2,
+                      item_callback=callback,
+                      postprocessor=_int_postprocessor, error_context=True)
+
+            error = exc_info.value
+            assert error.record_index == 3
+            assert error.element_path == ("records", "record", "value")
+            assert error.field_name == "value"
+            assert error.line == 4
+            assert error.column == 35
+            assert error.byte_index == 152
+            assert error.position_kind == "value"
+            assert delivered == [
+                {"value": [10, 11]},
+                {"value": [20, 21]},
+            ]
+
+
+def test_postprocessor_error_keeps_value_error_compatibility():
+    with pytest.raises(ValueError) as exc_info:
+        parse("<r><value>x</value></r>",
+              postprocessor=_int_postprocessor, error_context=True)
+    assert isinstance(exc_info.value, XMLPostprocessorError)
+    assert isinstance(exc_info.value.__cause__, ValueError)
+
+
+def test_error_context_aliases():
+    for option in ("source_context", "include_error_context"):
+        with pytest.raises(XMLPostprocessorError):
+            parse("<r><value>x</value></r>",
+                  postprocessor=_int_postprocessor, **{option: True})
+
+
+def test_postprocessor_error_context_is_opt_in():
+    def postprocessor(path, key, value):
+        if key == "value":
+            return key, int(value)
+        return key, value
+
+    with pytest.raises(ValueError) as exc_info:
+        parse("<r><value>x</value></r>", postprocessor=postprocessor)
+
+    assert not isinstance(exc_info.value, XMLPostprocessorError)
+
+
+def test_postprocessor_attribute_error_context_points_to_attribute_value():
+    def postprocessor(path, key, value):
+        if key == "@code":
+            raise ValueError("bad code")
+        return key, value
+
+    with pytest.raises(XMLPostprocessorError) as exc_info:
+        parse('<r code="中x"/>', postprocessor=postprocessor,
+              error_context=True)
+
+    error = exc_info.value
+    assert error.field_name == "@code"
+    assert error.position_kind == "attribute_value"
+    assert error.line == 1
+    assert error.column == 10
+    assert error.byte_index == 9
+
+
+def test_postprocessor_element_error_context_points_to_start_tag():
+    def postprocessor(path, key, value):
+        if key == "bad" and isinstance(value, dict):
+            raise ValueError("bad nested record")
+        return key, value
+
+    with pytest.raises(XMLPostprocessorError) as exc_info:
+        parse("<r>\n  <bad><x>v</x></bad>\n</r>",
+              postprocessor=postprocessor, error_context=True)
+
+    error = exc_info.value
+    assert error.position_kind == "start_tag"
+    assert error.element_path == ("r", "bad")
+    assert error.field_name == "bad"
+    assert error.line == 2
+    assert error.column == 3
+    assert error.byte_index == 6
+
+
+def test_parser_error_context_is_distinct_and_keeps_prior_callbacks():
+    delivered = []
+
+    def callback(path, item):
+        delivered.append(item)
+        return True
+
+    with pytest.raises(XMLSyntaxError) as exc_info:
+        parse(
+            "<records><record><value>1</value></record>"
+            "<record><value>2<</value></record></records>",
+            item_depth=2, item_callback=callback, error_context=True,
+        )
+
+    error = exc_info.value
+    assert isinstance(error.__cause__, expat.ExpatError)
+    assert error.position_kind == "parser_error"
+    assert error.record_index == 2
+    assert delivered == [{"value": "1"}]
+
+
+def test_error_context_streaming_does_not_store_byte_input():
+    try:
+        import tracemalloc
+    except ImportError:
+        pytest.skip("tracemalloc not available")
+
+    num_items = 20000
+
+    def xml_gen():
+        yield b"<a>"
+        for index in range(num_items):
+            yield f'<b attr="v">{index % 10}</b>'.encode()
+        yield b"</a>"
+
+    count = 0
+
+    def callback(path, item):
+        nonlocal count
+        count += 1
+        return True
+
+    tracemalloc.start()
+    parse(xml_gen(), item_depth=2, item_callback=callback,
+          error_context=True)
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert count == num_items
+    assert peak < 32 * 1024
+
+
+def test_parser_error_context_is_opt_in():
+    with pytest.raises(expat.ExpatError) as exc_info:
+        parse("<a>")
+    assert not isinstance(exc_info.value, XMLSyntaxError)
+
+
+def test_syntax_error_remains_compatible_with_expat_error_type():
+    with pytest.raises(expat.ExpatError):
+        parse("<a>", error_context=True)

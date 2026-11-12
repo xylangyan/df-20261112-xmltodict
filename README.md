@@ -220,6 +220,7 @@ Parse XML input into a Python dictionary.
 - `item_depth=0`: Depth at which to call `item_callback`.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
 - `comment_key='#comment'`: Key used for XML comments when `process_comments=True`. Only used when `process_comments=True`. Comments can be preserved but multiple top-level comments may not retain order.
+- `error_context=False`: Add source context to postprocessor and malformed XML errors. Postprocessor failures become `XMLPostprocessorError`, while malformed XML becomes `XMLSyntaxError`; the original exception is preserved as `__cause__`. The exception `context` dictionary contains `record_index`, `element_path`, `field_name`, one-based `line` and `column`, `byte_index`, and `position_kind`. Position kinds distinguish an element `start_tag`, a `value`, an `attribute_value`, and `parser_error`. `source_context` and `include_error_context` are accepted as aliases.
 
 ### xmltodict.unparse()
 
