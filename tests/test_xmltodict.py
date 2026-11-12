@@ -720,3 +720,172 @@ def test_force_list_true_applies_to_all_keys():
     xml = "<a><b>1</b><b>2</b><c>x</c></a>"
     expected = {"a": [{"b": ["1", "2"], "c": ["x"]}]}
     assert parse(xml, force_list=True) == expected
+
+
+def test_preserve_order_mixed_content():
+    xml = '<desc>Keep <b>24</b> hours <b>or more</b></desc>'
+    assert parse(xml, preserve_order=True) == {
+        'desc': {
+            'b': [
+                {'#events': [('text', '24')]},
+                {'#events': [('text', 'or more')]},
+            ],
+            '#events': [
+                ('text', 'Keep '),
+                ('element', 'b', {'#events': [('text', '24')]}),
+                ('text', ' hours '),
+                ('element', 'b', {'#events': [('text', 'or more')]}),
+            ],
+        },
+    }
+
+
+def test_preserve_order_text_only_and_empty_elements():
+    assert parse('<a>hello</a>', preserve_order=True) == \
+        {'a': {'#events': [('text', 'hello')]}}
+    assert parse('<a/>', preserve_order=True) == {'a': None}
+    assert parse('<a><b/><c>x</c></a>', preserve_order=True) == {
+        'a': {
+            'b': None,
+            'c': {'#events': [('text', 'x')]},
+            '#events': [
+                ('element', 'b', None),
+                ('element', 'c', {'#events': [('text', 'x')]}),
+            ],
+        },
+    }
+
+
+def test_preserve_order_repeated_tags_and_attributes():
+    xml = '<p id="7">x<a>1</a>y<a>2</a>z</p>'
+    doc = parse(xml, preserve_order=True)
+    assert doc['p']['@id'] == '7'
+    assert doc['p']['a'] == [
+        {'#events': [('text', '1')]},
+        {'#events': [('text', '2')]},
+    ]
+    assert [event[:2] for event in doc['p']['#events']] == [
+        ('text', 'x'),
+        ('element', 'a'),
+        ('text', 'y'),
+        ('element', 'a'),
+        ('text', 'z'),
+    ]
+    # The plain mapping and the event stream share the same objects, so
+    # edits through either view are visible to unparse.
+    assert doc['p']['a'][0] is doc['p']['#events'][1][2]
+
+
+def test_preserve_order_namespaced_children():
+    xml = ('<root xmlns="http://defaultns.com/" xmlns:a="http://a.com/">'
+           'lead<a:y>2</a:y>tail<a:y>3</a:y>end</root>')
+    doc = parse(xml, process_namespaces=True, preserve_order=True)
+    events = doc['http://defaultns.com/:root']['#events']
+    assert [event[0] for event in events] == \
+        ['text', 'element', 'text', 'element', 'text']
+    assert events[0][1] == 'lead'
+    assert events[2][1] == 'tail'
+    assert events[4][1] == 'end'
+    assert events[1][1] == 'http://a.com/:y'
+    assert events[3][1] == 'http://a.com/:y'
+    assert events[1][2] == {'#events': [('text', '2')]}
+    assert events[3][2] == {'#events': [('text', '3')]}
+
+
+def test_preserve_order_whitespace_handling():
+    # whitespace-only text is dropped like in the plain representation
+    doc = parse('<a>  <b>1</b> </a>', preserve_order=True)
+    assert doc['a']['#events'] == [
+        ('element', 'b', {'#events': [('text', '1')]}),
+    ]
+    # strip_whitespace=False keeps text chunks verbatim
+    doc = parse('<a> x <b>1</b> y </a>',
+                strip_whitespace=False, preserve_order=True)
+    assert doc['a']['#events'] == [
+        ('text', ' x '),
+        ('element', 'b', {'#events': [('text', '1')]}),
+        ('text', ' y '),
+    ]
+
+
+def test_preserve_order_streaming_matches_nonstreaming():
+    xml = '<r><item id="1">a<b>x</b>b</item><item>c</item></r>'
+    items = _stream(xml, 2, preserve_order=True)
+    assert items == parse(xml, preserve_order=True)['r']['item']
+    assert items[0]['#events'] == [
+        ('text', 'a'),
+        ('element', 'b', {'#events': [('text', 'x')]}),
+        ('text', 'b'),
+    ]
+    assert items[1] == {'#events': [('text', 'c')]}
+
+
+def test_preserve_order_postprocessor_applies_to_events():
+    def rename(path, key, value):
+        if key == 'a':
+            return 'renamed', value
+        return key, value
+
+    doc = parse('<p><a>1</a><a>2</a></p>',
+                postprocessor=rename, preserve_order=True)
+    assert doc['p']['renamed'] == [
+        {'#events': [('text', '1')]},
+        {'#events': [('text', '2')]},
+    ]
+    assert [event[:2] for event in doc['p']['#events']] == [
+        ('element', 'renamed'),
+        ('element', 'renamed'),
+    ]
+
+    def skip(path, key, value):
+        if key == 'a':
+            return None
+        return key, value
+
+    doc = parse('<p><a>1</a><b>2</b></p>',
+                postprocessor=skip, preserve_order=True)
+    assert 'a' not in doc['p']
+    assert doc['p']['#events'] == [
+        ('element', 'b', {'#events': [('text', '2')]}),
+    ]
+
+
+def test_preserve_order_force_list_and_force_cdata():
+    doc = parse('<a><b>1</b><b>2</b></a>',
+                force_list=('b',), preserve_order=True)
+    assert doc['a']['b'] == [
+        {'#events': [('text', '1')]},
+        {'#events': [('text', '2')]},
+    ]
+    assert [event[:2] for event in doc['a']['#events']] == [
+        ('element', 'b'),
+        ('element', 'b'),
+    ]
+    doc = parse('<a><b>x</b>y</a>', force_cdata=True, preserve_order=True)
+    assert doc['a']['#events'] == [
+        ('element', 'b', {'#text': 'x', '#events': [('text', 'x')]}),
+        ('text', 'y'),
+    ]
+
+
+def test_preserve_order_item_depth_below_document_returns_none():
+    # item_depth beyond the document depth streams nothing, like plain mode
+    assert parse('<a>x</a>', item_depth=5, preserve_order=True) is None
+
+
+def test_preserve_order_disabled_keeps_plain_shape():
+    # Compatibility: without preserve_order the representation is unchanged
+    xml = ('<catalog><item sku="A-1">'
+           '<desc>Keep <b>24</b> hours <b>or more</b></desc>'
+           '</item></catalog>')
+    assert parse(xml) == {
+        'catalog': {
+            'item': {
+                '@sku': 'A-1',
+                'desc': {
+                    'b': ['24', 'or more'],
+                    '#text': 'Keep  hours',
+                },
+            },
+        },
+    }

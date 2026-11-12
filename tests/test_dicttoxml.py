@@ -778,3 +778,116 @@ def test_pretty_print_top_level_comment_with_int_indent():
     <!--top-->
     <a>1</a>''')
     assert xml == unparse(obj, pretty=True, indent=4)
+
+
+def test_preserve_order_catalog_sample_parse_modify_unparse_reparse():
+    # End-to-end sample: product-catalog mixed content, one attribute edit,
+    # re-output and re-read. The text/child event order must survive.
+    xml = (
+        '<catalog xmlns:m="http://example.com/meta">'
+        '<item sku="A-1">'
+        '<desc>Keep <b>24</b> hours <b>or more</b></desc>'
+        '<m:note>note</m:note>'
+        '<empty/>'
+        '</item></catalog>'
+    )
+    doc = parse(xml, preserve_order=True)
+
+    # Edit one attribute and one leaf text node.
+    doc['catalog']['item']['@sku'] = 'B-2'
+    doc['catalog']['item']['desc']['b'][0]['#events'][0] = ('text', '48')
+
+    output = unparse(doc, preserve_order=True, full_document=False)
+    expected = (
+        '<catalog xmlns:m="http://example.com/meta">'
+        '<item sku="B-2">'
+        '<desc>Keep <b>48</b> hours <b>or more</b></desc>'
+        '<m:note>note</m:note><empty></empty>'
+        '</item></catalog>'
+    )
+    assert output == expected
+
+    re_parsed = parse(output, preserve_order=True)
+    assert re_parsed == doc
+
+    # Item-by-item comparison of the recorded content/child event order.
+    events = re_parsed['catalog']['item']['desc']['#events']
+    assert [event[:2] for event in events] == [
+        ('text', 'Keep '),
+        ('element', 'b'),
+        ('text', ' hours '),
+        ('element', 'b'),
+    ]
+    assert events[0][1] == 'Keep '
+    assert events[1][2] == {'#events': [('text', '48')]}
+    assert events[2][1] == ' hours '
+    assert events[3][2] == {'#events': [('text', 'or more')]}
+
+
+def test_preserve_order_repeated_tags_roundtrip():
+    xml = '<p>x<a>1</a>y<a>2</a>z</p>'
+    doc = parse(xml, preserve_order=True)
+    assert unparse(doc, preserve_order=True, full_document=False) == xml
+    assert parse(unparse(doc, preserve_order=True), preserve_order=True) == doc
+
+
+def test_preserve_order_empty_elements_roundtrip():
+    xml = '<a><b/><c>x</c></a>'
+    doc = parse(xml, preserve_order=True)
+    out = unparse(doc, preserve_order=True, short_empty_elements=True,
+                  full_document=False)
+    assert out == xml
+    assert parse(out, preserve_order=True) == doc
+
+
+def test_preserve_order_namespaced_children_roundtrip():
+    xml = ('<root xmlns="http://defaultns.com/" xmlns:a="http://a.com/">'
+           'lead<a:y>2</a:y>tail<a:y>3</a:y>end</root>')
+    namespaces = {'http://defaultns.com/': '', 'http://a.com/': 'a'}
+    doc = parse(xml, process_namespaces=True, preserve_order=True)
+    out = unparse(doc, preserve_order=True, namespaces=namespaces)
+    assert parse(out, process_namespaces=True, preserve_order=True) == doc
+    # The interleaved text was emitted around the child elements instead of
+    # being grouped after them as in the plain-dict roundtrip.
+    assert _strip(out) == (
+        '<root xmlns="http://defaultns.com/" xmlns:a="http://a.com/">'
+        'lead<a:y>2</a:y>tail<a:y>3</a:y>end</root>'
+    )
+
+
+def test_preserve_order_unparse_without_events_behaves_as_plain():
+    # Dicts that never had '#events' are emitted identically regardless of
+    # the flag, so plain and ordered callers can share output code.
+    obj = {'a': {'b': ['1', '2'], '#text': 'x'}}
+    assert unparse(obj, preserve_order=True) == unparse(obj)
+
+
+def test_preserve_order_random_roundtrip():
+    import random
+    rnd = random.Random(20261112)
+    tags = ('b', 'c', 'd')
+    for _ in range(300):
+        parts = []
+        for _ in range(rnd.randint(0, 5)):
+            tag = rnd.choice(tags)
+            text = rnd.choice(['', 'txt', '  ', 'a b'])
+            if rnd.random() < 0.5:
+                parts.append(f'{text}<{tag}>v</{tag}>')
+            else:
+                parts.append(f'<{tag}>v</{tag}>{text}')
+        xml = f'<r>{"".join(parts)}</r>'
+        doc = parse(xml, preserve_order=True)
+        output = unparse(doc, preserve_order=True, full_document=False)
+        re_parsed = parse(output, preserve_order=True)
+        assert re_parsed == doc, xml
+        # Every emitted text/element event must be reproducible in order.
+        if doc['r'] is not None:
+            assert re_parsed['r']['#events'] == doc['r']['#events'], xml
+
+
+def test_preserve_order_plain_mode_compat_sample():
+    # Compatibility case: the new flag is not enabled, so the plain shape is
+    # kept and unparse keeps its historical (non-order-preserving) output.
+    xml = '<a>abc<b/>def</a>'
+    assert parse(xml) == {'a': {'b': None, '#text': 'abcdef'}}
+    assert _strip(unparse(parse(xml))) == '<a><b></b>abcdef</a>'

@@ -220,6 +220,7 @@ Parse XML input into a Python dictionary.
 - `item_depth=0`: Depth at which to call `item_callback`.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
 - `comment_key='#comment'`: Key used for XML comments when `process_comments=True`. Only used when `process_comments=True`. Comments can be preserved but multiple top-level comments may not retain order.
+- `preserve_order=False`: Record the interleaving of text and child elements for mixed content. Each element with content gets an additional `'#events'` entry holding `('text', data)` and `('element', name, value)` groups. The rest of the dictionary keeps its usual shape, and `item_callback` receives the same representation when streaming. Pair with `unparse(..., preserve_order=True)` to emit children in their recorded order.
 
 ### xmltodict.unparse()
 
@@ -237,15 +238,54 @@ Convert a Python dictionary back into XML.
 - `indent='\t'`: Indentation string for pretty printing. May also be an integer number of spaces.
 - `newl='\n'`: Newline character for pretty printing.
 - `expand_iter=None`: Tag name to use for items in nested lists (breaks roundtripping).
+- `preserve_order=False`: Follow the `'#events'` streams recorded by `parse(..., preserve_order=True)`, emitting children in their original order instead of grouping them by key. Dictionaries without an `'#events'` entry are emitted exactly as usual.
 
 > **Note:** When building XML from dictionaries, keys whose values are empty
 > lists are skipped. For example, `{'a': []}` produces no `<a>` element. Add a
 > placeholder child (for example, `{'a': ['']}`) if an explicit empty container
 > element is required in the output.
 
-Note: xmltodict aims to cover the common 90% of cases. It does not preserve every XML nuance (attribute order, mixed content ordering, multiple top-level comments). For exact fidelity, use a full XML library such as lxml.
+Note: xmltodict aims to cover the common 90% of cases. It does not preserve every XML nuance (attribute order, multiple top-level comments, and mixed content ordering unless `preserve_order=True` is enabled). For exact fidelity, use a full XML library such as lxml.
 
 ## Examples
+
+### Preserving mixed content order
+
+Mixed content (text interleaved with child elements) normally collapses into a
+dictionary where the text is stored once under `#text` and children are
+grouped by tag. Pass `preserve_order=True` to keep the original sequence:
+
+```python
+>>> xml = '<desc>Keep <b>24</b> hours <b>or more</b></desc>'
+>>> doc = xmltodict.parse(xml, preserve_order=True)
+>>> doc['desc']['#events']
+[('text', 'Keep '), ('element', 'b', {'#events': [('text', '24')]}), ('text', ' hours '), ('element', 'b', {'#events': [('text', 'or more')]})]
+>>> doc['desc']['b']
+[{'#events': [('text', '24')]}, {'#events': [('text', 'or more')]}]
+```
+
+The plain keys are still there, so ordinary lookups and edits keep working.
+Modify a value (for example an attribute or a repeated child) and pass the same
+flag to `unparse` to reproduce the original order:
+
+```python
+>>> doc['desc']['b'][0]['#events'][0] = ('text', '48')
+>>> print(xmltodict.unparse(doc, preserve_order=True))
+<?xml version="1.0" encoding="utf-8"?>
+<desc>Keep <b>48</b> hours <b>or more</b></desc>
+```
+
+Notes:
+
+- `#events` is emitted only for elements that have content; empty elements
+  stay `None` in the plain mapping.
+- Repeated tags remain lists in the plain mapping, while each occurrence keeps
+  its own `#events` entry.
+- Nested dicts are shared between the plain mapping and the event stream, so
+  edits through either view are reflected on output.
+- Streaming (`item_depth` + `item_callback`) yields the same representation.
+- Comments are not part of the event stream; `process_comments` entries stay
+  in the plain mapping but are not emitted by `preserve_order=True` output.
 
 ### Selective force_cdata
 
